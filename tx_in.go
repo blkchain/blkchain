@@ -2,10 +2,16 @@ package blkchain
 
 import "io"
 
+type OutPoint struct {
+	Hash Uint256
+	N    uint32
+}
+
 type TxIn struct {
 	PrevOut   OutPoint
 	ScriptSig []byte
 	Sequence  uint32
+	Witness   Witness
 }
 
 func (tin *TxIn) BinRead(r io.Reader) (err error) {
