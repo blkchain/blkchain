@@ -5,7 +5,7 @@ import (
 	"io"
 	"log"
 
-	"github.com/grisha/blkchain"
+	"github.com/blkchain/blkchain"
 )
 
 func readBlocks(dbconnect, path string, magic uint32, startIdx int) {
