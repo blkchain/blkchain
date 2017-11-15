@@ -5,8 +5,8 @@ import (
 	"io"
 )
 
-func NewCoreStore(dir string, magic uint32) (io.Reader, error) {
-	fb, err := newFileBundle(dir)
+func NewCoreStore(dir string, start int, magic uint32) (io.Reader, error) {
+	fb, err := newFileBundle(dir, start)
 	if err != nil {
 		return nil, err
 	}

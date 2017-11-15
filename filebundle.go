@@ -15,10 +15,11 @@ type fileBundle struct {
 	f      *os.File
 }
 
-func newFileBundle(dir string) (*fileBundle, error) {
+func newFileBundle(dir string, start int) (*fileBundle, error) {
 	fb := &fileBundle{
 		dir:    dir,
 		prefix: "blk",
+		idx:    start,
 	}
 	if err := fb.next(); err != nil {
 		return nil, err
