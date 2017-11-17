@@ -3,6 +3,7 @@ package blkchain
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ func (f *fileBundle) next() (err error) {
 		f.idx++
 	}
 	path := filepath.Join(f.dir, fmt.Sprintf("%s%05d.dat", f.prefix, f.idx))
+	log.Printf("Scanning file: %v", path)
 	f.f, err = os.Open(path)
 
 	return err

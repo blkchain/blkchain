@@ -25,12 +25,14 @@ type blockRec struct {
 	prevId int
 	height int
 	block  *Block
+	sync   chan bool
 }
 
 type txRec struct {
 	id      int
 	blockId int
 	tx      *Tx
+	sync    chan bool
 }
 
 type txInRec struct {
@@ -60,6 +62,7 @@ func NewPGWriter(connstr string) (chan *Block, *sync.WaitGroup, error) {
 			// this is fine, cancel deferred index/constraint creation
 			deferredIndexes = false
 		} else {
+			log.Printf("Tables created. Warning, do not cancel this process, indexes are created at the very end.")
 			return nil, nil, err
 		}
 	}
@@ -86,16 +89,16 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 		return
 	}
 
-	blockCh := make(chan *blockRec, 1024)
+	blockCh := make(chan *blockRec, 64)
 	go pgBlockWriter(blockCh, db)
 
-	txCh := make(chan *txRec, 1024)
+	txCh := make(chan *txRec, 64)
 	go pgTxWriter(txCh, db)
 
-	txInCh := make(chan *txInRec, 1024)
+	txInCh := make(chan *txInRec, 64)
 	go pgTxInWriter(txInCh, db)
 
-	txOutCh := make(chan *txOutRec, 1024)
+	txOutCh := make(chan *txOutRec, 64)
 	go pgTxOutWriter(txOutCh, db)
 
 	writerWg.Add(4)
@@ -104,22 +107,31 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 
 	if len(bhash) > 0 {
 		log.Printf("Skipping to hash %v", uint256FromBytes(bhash))
-		skip := 0
+		skip, last := 0, time.Now()
 		for b := range ch {
 			hash := b.Hash()
 			if bytes.Compare(bhash, hash[:]) == 0 {
 				break
 			} else {
 				skip++
-				if skip%50000 == 0 {
-					log.Printf("Skipped %d blocks", skip)
+				if skip%10 == 0 && time.Now().Sub(last) > 5*time.Second {
+					log.Printf("Skipped %d blocks...", skip)
+					last = time.Now()
 				}
 			}
 		}
-		log.Printf("Skipped %d blocks", skip)
+		log.Printf("Skipped %d total blocks.", skip)
 	}
 
-	txcnt := 0
+	var syncCh chan bool
+	if !deferredIndexes {
+		// no deferredIndexes means that the constraints already
+		// exist, and we need to wait for a tx to be commited before
+		// ins/outs can be inserted. Same with block/tx.
+		syncCh = make(chan bool, 0)
+	}
+
+	txcnt, last := 0, time.Now()
 	for b := range ch {
 		bid++
 		height++
@@ -128,6 +140,10 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 			prevId: bid - 1,
 			height: height,
 			block:  b,
+			sync:   syncCh,
+		}
+		if syncCh != nil {
+			<-syncCh
 		}
 
 		for _, tx := range b.Txs {
@@ -137,6 +153,10 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 				id:      txid,
 				blockId: bid,
 				tx:      tx,
+				sync:    syncCh,
+			}
+			if syncCh != nil {
+				<-syncCh
 			}
 
 			for n, txin := range tx.TxIns {
@@ -156,14 +176,24 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 			}
 		}
 
-		if bid%60 == 0 {
-			blockCh <- nil
+		if !deferredIndexes {
+			// commit after every block
+			// blocks and txs are already commited
 			txInCh <- nil
 			txOutCh <- nil
+		} else if bid%50 == 0 {
+			// commit every N blocks
+			blockCh <- nil
 			txCh <- nil
+			txInCh <- nil
+			txOutCh <- nil
+		}
 
-			log.Printf("%v COMMIT at Height: %d Txs: %d Time: %v Tx/s: %02f\n",
-				time.Now(), bid, txcnt, time.Unix(int64(b.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
+		// report progress
+		if time.Now().Sub(last) > 5*time.Second {
+			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f\n",
+				height, txcnt, time.Unix(int64(b.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
+			last = time.Now()
 		}
 	}
 
@@ -242,6 +272,19 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 		if err != nil {
 			log.Printf("ERROR (3): %v", err)
 		}
+
+		if br.sync != nil {
+			// commit and send confirmation
+			if err = commit(stmt, txn); err != nil {
+				log.Printf("Block commit error (2): %v", err)
+			}
+			txn, stmt, err = begin(db, "blocks", cols)
+			if err != nil {
+				log.Printf("ERROR (2.5): %v", err)
+			}
+			br.sync <- true
+		}
+
 	}
 
 	log.Printf("Block writer channel closed, leaving.")
@@ -286,6 +329,17 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			log.Printf("ERROR (5): %v", err)
 		}
 
+		if tr.sync != nil {
+			// commit and send confirmation
+			if err = commit(stmt, txn); err != nil {
+				log.Printf("Tx commit error: %v", err)
+			}
+			txn, stmt, err = begin(db, "txs", cols)
+			if err != nil {
+				log.Printf("ERROR (4.5): %v", err)
+			}
+			tr.sync <- true
+		}
 	}
 
 	log.Printf("Tx writer channel closed, leaving.")
@@ -491,12 +545,19 @@ func createTables(db *sql.DB) error {
 func createIndexes(db *sql.DB) error {
 	sqlIndexes := `
     ALTER TABLE blocks ADD PRIMARY KEY(id);
+    ANALYZE blocks;
+
     ALTER TABLE txs ADD PRIMARY KEY(id);
-    ALTER TABLE txins ADD PRIMARY KEY(tx_id, n);
-    ALTER TABLE txouts ADD PRIMARY KEY(tx_id, n);
     CREATE INDEX ON txs(block_id);
     -- CREATE INDEX ON txs(txid);
     CREATE INDEX ON txs(substring(txid for 8));
+    ANALYZE txs;
+
+    ALTER TABLE txins ADD PRIMARY KEY(tx_id, n);
+    ANALYZE txins;
+
+    ALTER TABLE txouts ADD PRIMARY KEY(tx_id, n);
+    ANALYZE txouts;
 `
 	_, err := db.Exec(sqlIndexes)
 	return err

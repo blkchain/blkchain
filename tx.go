@@ -16,7 +16,7 @@ type Tx struct {
 
 func (tx *Tx) Hash() Uint256 {
 	buf := new(bytes.Buffer)
-	BinWrite(tx, buf)
+	tx.binWriteWithoutWitness(buf)
 	return ShaSha256(buf.Bytes())
 }
 
@@ -73,6 +73,9 @@ func (tx *Tx) BinWrite(w io.Writer) (err error) {
 	if err = BinWrite(tx.Version, w); err != nil {
 		return err
 	}
+	if tx.SegWit {
+		_, err = w.Write([]byte{0x00, 0x01})
+	}
 	if err = BinWrite(&tx.TxIns, w); err != nil {
 		return err
 	}
@@ -85,6 +88,24 @@ func (tx *Tx) BinWrite(w io.Writer) (err error) {
 				return err
 			}
 		}
+	}
+	if err = BinWrite(tx.LockTime, w); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (tx *Tx) binWriteWithoutWitness(w io.Writer) (err error) {
+	// This is for computing the txid, it is the transaction without
+	// the segwit marker and without the witness data.
+	if err = BinWrite(tx.Version, w); err != nil {
+		return err
+	}
+	if err = BinWrite(&tx.TxIns, w); err != nil {
+		return err
+	}
+	if err = BinWrite(&tx.TxOuts, w); err != nil {
+		return err
 	}
 	if err = BinWrite(tx.LockTime, w); err != nil {
 		return err
