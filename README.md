@@ -24,9 +24,9 @@ it with (Core should not be running):
 ```
 
 This will read all blocks and upload them to Postgres. On a 2011
-thinkpad with a spinning hard drive running Linux, and the whole
-import takes approximately 9 hours (~9,000 Tx/s), plus additional
-X hours to build the indexes and constraints.
+thinkpad with a spinning hard drive running Linux, the whole import
+takes approximately 9 hours (~9,000 Tx/s), plus additional X hours to
+build the indexes and constraints.
 
 On first run `import` will create the tables, initially without any
 indexes. This is as to keep the first import as fast as possible, the
@@ -88,18 +88,12 @@ index is unnecessarily large.
 
 One way to reduce the weight of the txid index is to only index the
 first few (8 seems like a good number) bytes. This is possible with
-expression indexes: `CREATE INDEX ON txs(substring(txid for 8))`. The
+_expression indexes_: `CREATE INDEX ON txs(substring(txid for 8))`. The
 catch is that we need to remember to always use the substring
-expression to look up transactions, but the size and speed gain is
-well worth it.
+expression to look up transactions. A more significant problem is that
+an expression index cannot be used with `FOREIGN KEY`.
 
-#### TX hash index
-
-Regardless, an index on the TX hash is very useful to look up
-transactions by txid (hash). The size of the index can be reduced by
-creating an _expression index_ of the first few bytes, but the
-downside is that it cannot be used as a foreign key. Postgres
-documentation discourages use of _hash indexes_ because of
+Postgres documentation discourages use of _hash indexes_ because of
 implementation problems, though they theoretically seem well fit for
 this.
 

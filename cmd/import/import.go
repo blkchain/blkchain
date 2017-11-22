@@ -4,13 +4,15 @@ import (
 	"flag"
 	"io"
 	"log"
+	"os"
+	"os/signal"
 
 	"github.com/blkchain/blkchain"
 )
 
-func readBlocks(dbconnect, path string, magic uint32, startIdx int) {
+func readBlocks(dbconnect, path string, magic uint32, startIdx int, cacheSize int) {
 
-	out, wg, err := blkchain.NewPGWriter(dbconnect)
+	out, wg, err := blkchain.NewPGWriter(dbconnect, cacheSize)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
@@ -19,6 +21,16 @@ func readBlocks(dbconnect, path string, magic uint32, startIdx int) {
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
+
+	interrupt := false
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	go func() {
+		<-sigCh
+		log.Printf("Interrupt, exiting scan loop...")
+		signal.Stop(sigCh)
+		interrupt = true
+	}()
 
 	for {
 		b := blkchain.Block{Magic: magic}
@@ -33,6 +45,10 @@ func readBlocks(dbconnect, path string, magic uint32, startIdx int) {
 		}
 
 		out <- &b
+
+		if interrupt {
+			break
+		}
 	}
 
 	close(out)
@@ -47,6 +63,7 @@ func main() {
 	blocksPath := flag.String("blocks", "", "/path/to/blocks")
 	testNet := flag.Bool("testnet", false, "Use testnet magic")
 	startIdx := flag.Int("start-idx", 0, "Start number of the blkXXXXXX file")
+	cacheSize := flag.Int("cache-size", 1024*1024*10, "Tx hashes to cache for pervout_tx_id")
 
 	flag.Parse()
 
@@ -61,5 +78,5 @@ func main() {
 		magic = blkchain.MainNetMagic
 	}
 
-	readBlocks(*connStr, *blocksPath, magic, *startIdx)
+	readBlocks(*connStr, *blocksPath, magic, *startIdx, *cacheSize)
 }

@@ -29,25 +29,27 @@ type blockRec struct {
 }
 
 type txRec struct {
-	id      int
+	id      int64
 	blockId int
 	tx      *Tx
+	hash    Uint256
 	sync    chan bool
 }
 
 type txInRec struct {
-	txId int
-	n    int
-	txIn *TxIn
+	txId    int64
+	n       int
+	txIn    *TxIn
+	idCache *txIdCache
 }
 
 type txOutRec struct {
-	txId  int
+	txId  int64
 	n     int
 	txOut *TxOut
 }
 
-func NewPGWriter(connstr string) (chan *Block, *sync.WaitGroup, error) {
+func NewPGWriter(connstr string, cacheSize int) (chan *Block, *sync.WaitGroup, error) {
 
 	var wg sync.WaitGroup
 
@@ -62,18 +64,18 @@ func NewPGWriter(connstr string) (chan *Block, *sync.WaitGroup, error) {
 			// this is fine, cancel deferred index/constraint creation
 			deferredIndexes = false
 		} else {
-			log.Printf("Tables created. Warning, do not cancel this process, indexes are created at the very end.")
+			log.Printf("Tables created without indexes, which are created at the very end.")
 			return nil, nil, err
 		}
 	}
 
 	ch := make(chan *Block, 64)
-	go pgBlockWorker(ch, &wg, db, deferredIndexes)
+	go pgBlockWorker(ch, &wg, db, deferredIndexes, cacheSize)
 
 	return ch, &wg, nil
 }
 
-func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool) {
+func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int) {
 
 	wg.Add(1)
 	defer wg.Done()
@@ -123,6 +125,8 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 		log.Printf("Skipped %d total blocks.", skip)
 	}
 
+	idCache := newTxIdCache(cacheSize)
+
 	var syncCh chan bool
 	if !deferredIndexes {
 		// no deferredIndexes means that the constraints already
@@ -149,10 +153,18 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 		for _, tx := range b.Txs {
 			txid++
 			txcnt++
+
+			hash := tx.Hash()
+
+			if len(tx.TxIns) > 0 && tx.TxIns[0].PrevOut.N != 0xffffffff {
+				idCache.add(hash, txid, len(tx.TxOuts))
+			}
+
 			txCh <- &txRec{
 				id:      txid,
 				blockId: bid,
 				tx:      tx,
+				hash:    hash,
 				sync:    syncCh,
 			}
 			if syncCh != nil {
@@ -161,9 +173,10 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 
 			for n, txin := range tx.TxIns {
 				txInCh <- &txInRec{
-					txId: txid,
-					n:    n,
-					txIn: txin,
+					txId:    txid,
+					n:       n,
+					txIn:    txin,
+					idCache: idCache,
 				}
 			}
 
@@ -206,17 +219,20 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 	writerWg.Wait()
 	log.Printf("Workers finished.")
 
-	if deferredIndexes {
-		log.Printf("Creating indexes, please be patient, this may take a long time...")
-		if err := createIndexes(db); err != nil {
-			log.Printf("Error creating indexes: %v", err)
-		}
-		log.Printf("Creating constraints, please be patient, this may take a long time...")
-		if err := createConstraints(db); err != nil {
-			log.Printf("Error creating constraints: %v", err)
-		}
-		log.Printf("Indexes and constraints created.")
+	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d evictions: %d",
+		idCache.hits, float64(idCache.hits)/(float64(idCache.hits+idCache.miss)+0.0001)*100,
+		idCache.miss, idCache.cols, idCache.evic)
+
+	verbose := deferredIndexes
+	log.Printf("Creating indexes (if needed), please be patient, this may take a long time...")
+	if err := createIndexes(db, verbose); err != nil {
+		log.Printf("Error creating indexes: %v", err)
 	}
+	log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
+	if err := createConstraints(db, verbose); err != nil {
+		log.Printf("Error creating constraints: %v", err)
+	}
+	log.Printf("Indexes and constraints created.")
 }
 
 func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) {
@@ -317,11 +333,10 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 		}
 
 		t := tr.tx
-		hash := t.Hash()
 		_, err = stmt.Exec(
 			tr.id,
 			tr.blockId,
-			hash[:],
+			tr.hash[:],
 			int32(t.Version),
 			int32(t.LockTime),
 		)
@@ -352,7 +367,7 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"tx_id", "n", "prevout_hash", "prevout_n", "scriptsig", "sequence", "witness"}
+	cols := []string{"tx_id", "n", "prevout_hash", "prevout_n", "scriptsig", "sequence", "witness", "prevout_tx_id"}
 
 	txn, stmt, err := begin(db, "txins", cols)
 	if err != nil {
@@ -379,6 +394,11 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 			wb = b.Bytes()
 		}
 
+		var prevOutTxId *int64 = nil
+		if t.PrevOut.N != 0xffffffff { // coinbase
+			prevOutTxId = tr.idCache.check(t.PrevOut.Hash)
+		}
+
 		_, err = stmt.Exec(
 			tr.txId,
 			tr.n,
@@ -387,6 +407,7 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 			t.ScriptSig,
 			int32(t.Sequence),
 			wb,
+			prevOutTxId,
 		)
 		if err != nil {
 			log.Printf("ERROR (8): %v", err)
@@ -480,7 +501,7 @@ func getLastHashAndHeight(db *sql.DB) (int, int, []byte, error) {
 	return 0, 0, nil, rows.Err()
 }
 
-func getLastTxId(db *sql.DB) (int, error) {
+func getLastTxId(db *sql.DB) (int64, error) {
 
 	rows, err := db.Query("SELECT id FROM txs ORDER BY id DESC LIMIT 1")
 	if err != nil {
@@ -489,7 +510,7 @@ func getLastTxId(db *sql.DB) (int, error) {
 	defer rows.Close()
 
 	if rows.Next() {
-		var id int
+		var id int64
 		if err := rows.Scan(&id); err != nil {
 			return 0, err
 		}
@@ -503,7 +524,7 @@ func createTables(db *sql.DB) error {
   CREATE TABLE blocks (
    id           SERIAL
   ,prev         INT NOT NULL
-  ,height       INT NOT NULL -- not same as id, because orphans
+  ,height       INT NOT NULL -- not same as id, because orphans.
   ,hash         BYTEA NOT NULL
   ,version      INT NOT NULL
   ,prevhash     BYTEA NOT NULL
@@ -529,6 +550,7 @@ func createTables(db *sql.DB) error {
   ,scriptsig     BYTEA NOT NULL
   ,sequence      INT NOT NULL
   ,witness       BYTEA
+  ,prevout_tx_id BIGINT
   );
 
   CREATE TABLE txouts (
@@ -542,44 +564,127 @@ func createTables(db *sql.DB) error {
 	return err
 }
 
-func createIndexes(db *sql.DB) error {
-	sqlIndexes := `
-    ALTER TABLE blocks ADD PRIMARY KEY(id);
-    ANALYZE blocks;
+func createIndexes(db *sql.DB, verbose bool) error {
+	// Adding a constraint or index if it does not exist is a little tricky in PG
+	if verbose {
+		log.Printf("  - blocks primary key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'blocks' AND constraint_name = 'blocks_pkey') THEN
+            ALTER TABLE blocks ADD CONSTRAINT blocks_pkey PRIMARY KEY(id);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txs primary key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txs' AND constraint_name = 'txs_pkey') THEN
+            ALTER TABLE txs ADD CONSTRAINT txs_pkey PRIMARY KEY(id);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txs block_id index...")
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txs_block_id_idx ON txs(block_id);"); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txs txid (hash) index...")
+	}
+	// _, err := db.Exec("-- CREATE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);")
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txs_substring_idx ON txs(substring(txid for 8));"); err != nil {
+		return err
+	}
+	// Expression indexes require analyze?
+	//log.Printf("  - analyzing txs table...")
+	//_, err := db.Exec("ANALYZE txs;")
+	if verbose {
+		log.Printf("  - txins primary key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txins' AND constraint_name = 'txins_pkey') THEN
+            ALTER TABLE txins ADD CONSTRAINT txins_pkey PRIMARY KEY(tx_id, n);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txouts primary key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txouts' AND constraint_name = 'txouts_pkey') THEN
+            ALTER TABLE txouts ADD CONSTRAINT txouts_pkey PRIMARY KEY(tx_id, n);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
 
-    ALTER TABLE txs ADD PRIMARY KEY(id);
-    CREATE INDEX ON txs(block_id);
-    -- CREATE INDEX ON txs(txid);
-    CREATE INDEX ON txs(substring(txid for 8));
-    ANALYZE txs;
-
-    ALTER TABLE txins ADD PRIMARY KEY(tx_id, n);
-    ANALYZE txins;
-
-    ALTER TABLE txouts ADD PRIMARY KEY(tx_id, n);
-    ANALYZE txouts;
-`
-	_, err := db.Exec(sqlIndexes)
-	return err
+	return nil
 }
 
-func createConstraints(db *sql.DB) error {
-	sqlConstraints := `
-    ALTER TABLE txs
-      ADD CONSTRAINT fk_txs_block_id
-      FOREIGN KEY (block_id)
-      REFERENCES blocks(id);
-
-    ALTER TABLE txins
-      ADD CONSTRAINT fk_txins_tx_id
-      FOREIGN KEY (tx_id)
-      REFERENCES txs(id);
-
-    ALTER TABLE txouts
-      ADD CONSTRAINT fk_txouts_tx_id
-      FOREIGN KEY (tx_id)
-      REFERENCES txs(id);
-  `
-	_, err := db.Exec(sqlConstraints)
-	return err
+func createConstraints(db *sql.DB, verbose bool) error {
+	// NB: table_name is the target/foreign table!
+	if verbose {
+		log.Printf("  - txs block_id foreign key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'blocks' AND constraint_name = 'txs_block_id_fkey') THEN
+           ALTER TABLE txs ADD CONSTRAINT txs_block_id_fkey FOREIGN KEY (block_id) REFERENCES blocks(id);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txsins tx_id foreign key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txs' AND constraint_name = 'txins_tx_id_fkey') THEN
+           ALTER TABLE txins ADD CONSTRAINT txins_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txsins tx_id foreign key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txs' AND constraint_name = 'txouts_tx_id_fkey') THEN
+           ALTER TABLE txouts ADD CONSTRAINT txouts_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
+	return nil
 }
