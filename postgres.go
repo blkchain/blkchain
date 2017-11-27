@@ -25,6 +25,8 @@ type blockRec struct {
 	prevId int
 	height int
 	block  *Block
+	hash   Uint256
+	orphan bool
 	sync   chan bool
 }
 
@@ -75,7 +77,7 @@ func NewPGWriter(connstr string, cacheSize int) (chan *Block, *sync.WaitGroup, e
 	return ch, &wg, nil
 }
 
-func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int) {
+func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int) {
 
 	wg.Add(1)
 	defer wg.Done()
@@ -91,8 +93,9 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 		return
 	}
 
-	blockCh := make(chan *blockRec, 64)
-	go pgBlockWriter(blockCh, db)
+	blockStreamCh := make(chan *blockRec, 64)
+	blockCh := newBlockStream(blockStreamCh, 10)
+	go pgBlockWriter(blockStreamCh, db)
 
 	txCh := make(chan *txRec, 64)
 	go pgTxWriter(txCh, db)
@@ -138,12 +141,14 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 	txcnt, last := 0, time.Now()
 	for b := range ch {
 		bid++
-		height++
+		height++ // this is only for the status log, approximate
+		hash := b.Hash()
 		blockCh <- &blockRec{
 			id:     bid,
 			prevId: bid - 1,
-			height: height,
+			height: height, // will be overwritten by graph
 			block:  b,
+			hash:   hash,
 			sync:   syncCh,
 		}
 		if syncCh != nil {
@@ -232,6 +237,10 @@ func pgBlockWorker(ch chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndex
 	if err := createConstraints(db, verbose); err != nil {
 		log.Printf("Error creating constraints: %v", err)
 	}
+	log.Printf("Computing block heights...")
+	if err := computeHeights(db, verbose); err != nil {
+		log.Printf("Error computing height: %v", err)
+	}
 	log.Printf("Indexes and constraints created.")
 }
 
@@ -251,7 +260,7 @@ func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) 
 func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"id", "prev", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce"}
+	cols := []string{"id", "prev", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan"}
 
 	txn, stmt, err := begin(db, "blocks", cols)
 	if err != nil {
@@ -272,18 +281,18 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 		}
 
 		b := br.block
-		hash := b.Hash()
 		_, err = stmt.Exec(
 			br.id,
 			br.prevId,
 			br.height,
-			hash[:],
+			br.hash[:],
 			int32(b.Version),
 			b.PrevHash[:],
 			b.HashMerkleRoot[:],
 			int32(b.Time),
 			int32(b.Bits),
 			int32(b.Nonce),
+			br.orphan,
 		)
 		if err != nil {
 			log.Printf("ERROR (3): %v", err)
@@ -498,7 +507,8 @@ func getLastHashAndHeight(db *sql.DB) (int, int, []byte, error) {
 		}
 		return id, height, hash, nil
 	}
-	return 0, 0, nil, rows.Err()
+	// Initial height is -1, so that 1st block is height 0
+	return 0, -1, nil, rows.Err()
 }
 
 func getLastTxId(db *sql.DB) (int64, error) {
@@ -532,6 +542,7 @@ func createTables(db *sql.DB) error {
   ,time         INT NOT NULL
   ,bits         INT NOT NULL
   ,nonce        INT NOT NULL
+  ,orphan       BOOLEAN NOT NULL DEFAULT false
   );
 
   CREATE TABLE txs (
@@ -578,6 +589,18 @@ func createIndexes(db *sql.DB, verbose bool) error {
          END IF;
        END
        $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - blocks prevhash index...")
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS blocks_prevhash_idx ON blocks(prevhash);"); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - blocks hash index...")
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS blocks_hash_idx ON blocks(hash);"); err != nil {
 		return err
 	}
 	if verbose {
@@ -687,4 +710,35 @@ func createConstraints(db *sql.DB, verbose bool) error {
 		return err
 	}
 	return nil
+}
+
+// NB: Computing height is not as simple as just figuring the row
+// number. The chain may contain splits, i.e. it is possible for more
+// than one block to have the same prevhash. The height is the height
+// or the prevhash block incremented by 1. This is where WITH
+// RECURSIVE comes in very handy.
+func computeHeights(db *sql.DB, verbose bool) error {
+	// NB: table_name is the target/foreign table!
+	if verbose {
+		log.Printf("  - block height...")
+	}
+	if _, err := db.Exec(`
+UPDATE blocks
+   SET height = h
+  FROM (
+    WITH RECURSIVE recur(id, h, hash) AS (
+      SELECT id, 0 as h, hash
+        FROM blocks
+        WHERE prevhash = E'\\x0000000000000000000000000000000000000000000000000000000000000000'
+      UNION ALL
+      SELECT blocks.id, h+1 AS h, blocks.hash
+        FROM recur
+        JOIN blocks ON blocks.prevhash = recur.hash
+    )
+    SELECT id, h, hash FROM recur
+  ) x
+  WHERE blocks.id = x.id;
+       `); err != nil {
+		return err
+	}
 }
