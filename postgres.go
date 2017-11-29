@@ -3,6 +3,7 @@ package blkchain
 import (
 	"bytes"
 	"database/sql"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -22,7 +23,6 @@ var writerWg sync.WaitGroup
 
 type blockRec struct {
 	id     int
-	prevId int
 	height int
 	block  *Block
 	hash   Uint256
@@ -93,9 +93,8 @@ func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredInd
 		return
 	}
 
-	blockStreamCh := make(chan *blockRec, 64)
-	blockCh := newBlockStream(blockStreamCh, 10)
-	go pgBlockWriter(blockStreamCh, db)
+	blockCh := make(chan *blockRec, 64)
+	go pgBlockWriter(blockCh, db)
 
 	txCh := make(chan *txRec, 64)
 	go pgTxWriter(txCh, db)
@@ -141,12 +140,11 @@ func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredInd
 	txcnt, last := 0, time.Now()
 	for b := range ch {
 		bid++
-		height++ // this is only for the status log, approximate
+		height++
 		hash := b.Hash()
 		blockCh <- &blockRec{
 			id:     bid,
-			prevId: bid - 1,
-			height: height, // will be overwritten by graph
+			height: height, // bogus, will be corrected later in SQL
 			block:  b,
 			hash:   hash,
 			sync:   syncCh,
@@ -238,8 +236,12 @@ func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredInd
 		log.Printf("Error creating constraints: %v", err)
 	}
 	log.Printf("Computing block heights...")
-	if err := computeHeights(db, verbose); err != nil {
+	if err := computeHeights(db); err != nil {
 		log.Printf("Error computing height: %v", err)
+	}
+	log.Printf("Marking orphan blocks...")
+	if err := setOrphans(db, 0); err != nil {
+		log.Printf("Error marking orphans: %v", err)
 	}
 	log.Printf("Indexes and constraints created.")
 }
@@ -260,7 +262,7 @@ func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) 
 func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"id", "prev", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan"}
+	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan"}
 
 	txn, stmt, err := begin(db, "blocks", cols)
 	if err != nil {
@@ -283,7 +285,6 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 		b := br.block
 		_, err = stmt.Exec(
 			br.id,
-			br.prevId,
 			br.height,
 			br.hash[:],
 			int32(b.Version),
@@ -533,7 +534,6 @@ func createTables(db *sql.DB) error {
 	sqlTables := `
   CREATE TABLE blocks (
    id           SERIAL
-  ,prev         INT NOT NULL
   ,height       INT NOT NULL -- not same as id, because orphans.
   ,hash         BYTEA NOT NULL
   ,version      INT NOT NULL
@@ -604,6 +604,12 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
+		log.Printf("  - blocks height index...")
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS blocks_height_idx ON blocks(height);"); err != nil {
+		return err
+	}
+	if verbose {
 		log.Printf("  - txs primary key...")
 	}
 	if _, err := db.Exec(`
@@ -666,13 +672,13 @@ func createIndexes(db *sql.DB, verbose bool) error {
 }
 
 func createConstraints(db *sql.DB, verbose bool) error {
-	// NB: table_name is the target/foreign table!
 	if verbose {
 		log.Printf("  - txs block_id foreign key...")
 	}
 	if _, err := db.Exec(`
        DO $$
        BEGIN
+         -- NB: table_name is the target/foreign table
          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
                          WHERE table_name = 'blocks' AND constraint_name = 'txs_block_id_fkey') THEN
            ALTER TABLE txs ADD CONSTRAINT txs_block_id_fkey FOREIGN KEY (block_id) REFERENCES blocks(id);
@@ -687,6 +693,7 @@ func createConstraints(db *sql.DB, verbose bool) error {
 	if _, err := db.Exec(`
        DO $$
        BEGIN
+         -- NB: table_name is the target/foreign table
          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
                          WHERE table_name = 'txs' AND constraint_name = 'txins_tx_id_fkey') THEN
            ALTER TABLE txins ADD CONSTRAINT txins_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
@@ -701,6 +708,7 @@ func createConstraints(db *sql.DB, verbose bool) error {
 	if _, err := db.Exec(`
        DO $$
        BEGIN
+         -- NB: table_name is the target/foreign table
          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
                          WHERE table_name = 'txs' AND constraint_name = 'txouts_tx_id_fkey') THEN
            ALTER TABLE txouts ADD CONSTRAINT txouts_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
@@ -717,14 +725,10 @@ func createConstraints(db *sql.DB, verbose bool) error {
 // than one block to have the same prevhash. The height is the height
 // or the prevhash block incremented by 1. This is where WITH
 // RECURSIVE comes in very handy.
-func computeHeights(db *sql.DB, verbose bool) error {
-	// NB: table_name is the target/foreign table!
-	if verbose {
-		log.Printf("  - block height...")
-	}
+func computeHeights(db *sql.DB) error {
 	if _, err := db.Exec(`
 UPDATE blocks
-   SET height = h
+   SET height = a.h, prev = a.id
   FROM (
     WITH RECURSIVE recur(id, h, hash) AS (
       SELECT id, 0 as h, hash
@@ -736,9 +740,46 @@ UPDATE blocks
         JOIN blocks ON blocks.prevhash = recur.hash
     )
     SELECT id, h, hash FROM recur
-  ) x
-  WHERE blocks.id = x.id;
+  ) a
+  WHERE blocks.id = a.id;
        `); err != nil {
 		return err
 	}
+	return nil
+}
+
+// Set the orphan status starting from the highest block and going
+// backwards, up to limit. If limit is 0, the whole table is updated.
+func setOrphans(db *sql.DB, limit int) error {
+	var limitSql string
+	if limit > 0 {
+		limitSql = fmt.Sprintf("WHERE n < %d", limit)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`
+UPDATE blocks
+   SET orphan = a.orphan
+  FROM (
+    SELECT blocks.id, x.id IS NULL AS orphan
+      FROM blocks
+      LEFT JOIN (
+        WITH RECURSIVE recur(id, prevhash) AS (
+          SELECT id, prevhash, 0 AS n
+            FROM blocks
+                            -- this should be faster than MAX(height)
+           WHERE height IN (SELECT height FROM blocks ORDER BY height DESC LIMIT 1)
+          UNION ALL
+            SELECT blocks.id, blocks.prevhash, n+1 AS n
+              FROM recur
+              JOIN blocks ON blocks.hash = recur.prevhash
+            %s
+        )
+        SELECT recur.id, recur.prevhash, n
+          FROM recur
+      ) x ON blocks.id = x.id
+   ) a
+  WHERE blocks.id = a.id;
+       `, limitSql)); err != nil {
+		return err
+	}
+	return nil
 }
