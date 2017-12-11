@@ -22,17 +22,21 @@ import (
 var writerWg sync.WaitGroup
 
 type blockRec struct {
-	id     int
-	height int
-	block  *Block
-	hash   Uint256
-	orphan bool
-	sync   chan bool
+	id      int
+	height  int
+	block   *Block
+	hash    Uint256
+	orphan  bool
+	status  int
+	filen   int
+	filepos int
+	sync    chan bool
 }
 
 type txRec struct {
 	id      int64
 	blockId int
+	n       int // position within block
 	tx      *Tx
 	hash    Uint256
 	sync    chan bool
@@ -51,7 +55,15 @@ type txOutRec struct {
 	txOut *TxOut
 }
 
-func NewPGWriter(connstr string, cacheSize int) (chan *Block, *sync.WaitGroup, error) {
+type BlockInfo struct {
+	*Block
+	Height,
+	Status,
+	FileN,
+	FilePos int
+}
+
+func NewPGWriter(connstr string, cacheSize int) (chan *BlockInfo, *sync.WaitGroup, error) {
 
 	var wg sync.WaitGroup
 
@@ -71,18 +83,19 @@ func NewPGWriter(connstr string, cacheSize int) (chan *Block, *sync.WaitGroup, e
 		}
 	}
 
-	ch := make(chan *Block, 64)
+	ch := make(chan *BlockInfo, 64)
 	go pgBlockWorker(ch, &wg, db, deferredIndexes, cacheSize)
 
 	return ch, &wg, nil
 }
 
-func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int) {
+func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int) {
 
 	wg.Add(1)
 	defer wg.Done()
 
 	bid, height, bhash, err := getLastHashAndHeight(db)
+	_ = height
 	if err != nil {
 		log.Printf("Error getting last hash and height, exiting: %v", err)
 		return
@@ -138,40 +151,51 @@ func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredInd
 	}
 
 	txcnt, last := 0, time.Now()
-	for b := range ch {
+	for bi := range ch {
 		bid++
-		height++
-		hash := b.Hash()
+		hash := bi.Hash()
 		blockCh <- &blockRec{
-			id:     bid,
-			height: height, // bogus, will be corrected later in SQL
-			block:  b,
-			hash:   hash,
-			sync:   syncCh,
+			id:      bid,
+			height:  bi.Height,
+			block:   bi.Block,
+			hash:    hash,
+			status:  bi.Status,
+			filen:   bi.FileN,
+			filepos: bi.FilePos,
+			sync:    syncCh,
 		}
 		if syncCh != nil {
 			<-syncCh
 		}
 
-		for _, tx := range b.Txs {
+		for n, tx := range bi.Txs {
 			txid++
 			txcnt++
 
 			hash := tx.Hash()
 
-			if len(tx.TxIns) > 0 && tx.TxIns[0].PrevOut.N != 0xffffffff {
-				idCache.add(hash, txid, len(tx.TxOuts))
+			// Check if recently seen and add to cache.
+			recentId := idCache.add(hash, txid, len(tx.TxOuts))
+
+			if recentId == txid {
+				// This is a not recently seen transaction
+				txCh <- &txRec{
+					id:      txid,
+					n:       n,
+					blockId: bid,
+					tx:      tx,
+					hash:    hash,
+					sync:    syncCh,
+				}
 			}
 
-			txCh <- &txRec{
-				id:      txid,
-				blockId: bid,
-				tx:      tx,
-				hash:    hash,
-				sync:    syncCh,
-			}
 			if syncCh != nil {
 				<-syncCh
+			}
+
+			if recentId != txid {
+				// This is a recent transaction, nothing to do
+				continue
 			}
 
 			for n, txin := range tx.TxIns {
@@ -208,7 +232,7 @@ func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredInd
 		// report progress
 		if time.Now().Sub(last) > 5*time.Second {
 			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f\n",
-				height, txcnt, time.Unix(int64(b.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
+				bi.Height, txcnt, time.Unix(int64(bi.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
 			last = time.Now()
 		}
 	}
@@ -222,22 +246,30 @@ func pgBlockWorker(ch <-chan *Block, wg *sync.WaitGroup, db *sql.DB, deferredInd
 	writerWg.Wait()
 	log.Printf("Workers finished.")
 
-	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d evictions: %d",
+	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d dupes: %d evictions: %d",
 		idCache.hits, float64(idCache.hits)/(float64(idCache.hits+idCache.miss)+0.0001)*100,
-		idCache.miss, idCache.cols, idCache.evic)
+		idCache.miss, idCache.cols, idCache.dups, idCache.evic)
 
 	verbose := deferredIndexes
-	log.Printf("Creating indexes (if needed), please be patient, this may take a long time...")
-	if err := createIndexes(db, verbose); err != nil {
+	log.Printf("Creating indexes part 1 (if needed), please be patient, this may take a long time...")
+	if err := createIndexes1(db, verbose); err != nil {
+		log.Printf("Error creating indexes: %v", err)
+	}
+	log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
+	if err := fixPrevoutTxId(db); err != nil {
+		log.Printf("Error fixing prevout_tx_id: %v", err)
+	}
+	log.Printf("Marking spent outputs (if needed), this may take a *really* long time (hours)...")
+	if err := markSpentOutputs(db); err != nil {
+		log.Printf("Error fixing prevout_tx_id: %v", err)
+	}
+	log.Printf("Creating indexes part 2 (if needed), please be patient, this may take a long time...")
+	if err := createIndexes1(db, verbose); err != nil {
 		log.Printf("Error creating indexes: %v", err)
 	}
 	log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
 	if err := createConstraints(db, verbose); err != nil {
 		log.Printf("Error creating constraints: %v", err)
-	}
-	log.Printf("Computing block heights...")
-	if err := computeHeights(db); err != nil {
-		log.Printf("Error computing height: %v", err)
 	}
 	log.Printf("Marking orphan blocks...")
 	if err := setOrphans(db, 0); err != nil {
@@ -262,7 +294,7 @@ func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) 
 func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan"}
+	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan", "status", "filen", "filepos"}
 
 	txn, stmt, err := begin(db, "blocks", cols)
 	if err != nil {
@@ -294,6 +326,9 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 			int32(b.Bits),
 			int32(b.Nonce),
 			br.orphan,
+			int32(br.status),
+			int32(br.filen),
+			int32(br.filepos),
 		)
 		if err != nil {
 			log.Printf("ERROR (3): %v", err)
@@ -323,11 +358,17 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 func pgTxWriter(c chan *txRec, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"id", "block_id", "txid", "version", "locktime"}
+	cols := []string{"id", "txid", "version", "locktime"}
+	bcols := []string{"block_id", "n", "tx_id"}
 
 	txn, stmt, err := begin(db, "txs", cols)
 	if err != nil {
 		log.Printf("ERROR (3): %v", err)
+	}
+
+	btxn, bstmt, err := begin(db, "block_txs", bcols)
+	if err != nil {
+		log.Printf("ERROR (4): %v", err)
 	}
 
 	for tr := range c {
@@ -335,9 +376,16 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			if err = commit(stmt, txn); err != nil {
 				log.Printf("Tx commit error: %v", err)
 			}
+			if err = commit(bstmt, btxn); err != nil {
+				log.Printf("Block Txs commit error: %v", err)
+			}
 			txn, stmt, err = begin(db, "txs", cols)
 			if err != nil {
-				log.Printf("ERROR (4): %v", err)
+				log.Printf("ERROR (5): %v", err)
+			}
+			btxn, bstmt, err = begin(db, "block_txs", bcols)
+			if err != nil {
+				log.Printf("ERROR (6): %v", err)
 			}
 			continue
 		}
@@ -345,13 +393,21 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 		t := tr.tx
 		_, err = stmt.Exec(
 			tr.id,
-			tr.blockId,
 			tr.hash[:],
 			int32(t.Version),
 			int32(t.LockTime),
 		)
 		if err != nil {
-			log.Printf("ERROR (5): %v", err)
+			log.Printf("ERROR (7): %v", err)
+		}
+
+		_, err = bstmt.Exec(
+			tr.blockId,
+			tr.n,
+			tr.id,
+		)
+		if err != nil {
+			log.Printf("ERROR (7.5): %v", err)
 		}
 
 		if tr.sync != nil {
@@ -359,9 +415,16 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			if err = commit(stmt, txn); err != nil {
 				log.Printf("Tx commit error: %v", err)
 			}
+			if err = commit(bstmt, btxn); err != nil {
+				log.Printf("Block Txs commit error: %v", err)
+			}
 			txn, stmt, err = begin(db, "txs", cols)
 			if err != nil {
-				log.Printf("ERROR (4.5): %v", err)
+				log.Printf("ERROR (8): %v", err)
+			}
+			btxn, bstmt, err = begin(db, "block_txs", bcols)
+			if err != nil {
+				log.Printf("ERROR (8.5): %v", err)
 			}
 			tr.sync <- true
 		}
@@ -370,6 +433,9 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 	log.Printf("Tx writer channel closed, leaving.")
 	if err = commit(stmt, txn); err != nil {
 		log.Printf("Tx commit error: %v", err)
+	}
+	if err = commit(bstmt, btxn); err != nil {
+		log.Printf("Block Txs commit error: %v", err)
 	}
 
 }
@@ -381,7 +447,7 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 
 	txn, stmt, err := begin(db, "txins", cols)
 	if err != nil {
-		log.Printf("ERROR (6): %v", err)
+		log.Printf("ERROR (9): %v", err)
 	}
 
 	for tr := range c {
@@ -391,7 +457,7 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 			}
 			txn, stmt, err = begin(db, "txins", cols)
 			if err != nil {
-				log.Printf("ERROR (7): %v", err)
+				log.Printf("ERROR (10): %v", err)
 			}
 			continue
 		}
@@ -420,7 +486,7 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 			prevOutTxId,
 		)
 		if err != nil {
-			log.Printf("ERROR (8): %v", err)
+			log.Printf("ERROR (11): %v", err)
 		}
 
 	}
@@ -438,7 +504,7 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB) {
 
 	txn, stmt, err := begin(db, "txouts", cols)
 	if err != nil {
-		log.Printf("ERROR (9): %v", err)
+		log.Printf("ERROR (12): %v", err)
 	}
 
 	for tr := range c {
@@ -449,7 +515,7 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB) {
 			}
 			txn, stmt, err = begin(db, "txouts", cols)
 			if err != nil {
-				log.Printf("ERROR (10): %v", err)
+				log.Printf("ERROR (13): %v", err)
 			}
 			continue
 		}
@@ -543,14 +609,22 @@ func createTables(db *sql.DB) error {
   ,bits         INT NOT NULL
   ,nonce        INT NOT NULL
   ,orphan       BOOLEAN NOT NULL DEFAULT false
+  ,status       INT NOT NULL
+  ,filen        INT NOT NULL
+  ,filepos      INT NOT NULL
   );
 
   CREATE TABLE txs (
    id            BIGSERIAL
-  ,block_id      INT NOT NULL
   ,txid          BYTEA NOT NULL -- the hash, cannot be unique
   ,version       INT NOT NULL
   ,locktime      INT NOT NULL
+  );
+
+  CREATE TABLE block_txs (
+   block_id      INT NOT NULL
+  ,n             INT NOT NULL
+  ,tx_id         BIGINT NOT NULL
   );
 
   CREATE TABLE txins (
@@ -569,13 +643,15 @@ func createTables(db *sql.DB) error {
   ,n            INT NOT NULL
   ,value        BIGINT NOT NULL
   ,scriptpubkey BYTEA NOT NULL
+  ,spend_tx_id  BIGINT
+  ,spend_n      INT
   );
 `
 	_, err := db.Exec(sqlTables)
 	return err
 }
 
-func createIndexes(db *sql.DB, verbose bool) error {
+func createIndexes1(db *sql.DB, verbose bool) error {
 	// Adding a constraint or index if it does not exist is a little tricky in PG
 	if verbose {
 		log.Printf("  - blocks primary key...")
@@ -624,21 +700,35 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txs block_id index...")
+		log.Printf("  - txs txid (hash) index...")
 	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txs_block_id_idx ON txs(block_id);"); err != nil {
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);"); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txs txid (hash) index...")
+		log.Printf("  - block_txs block_id, n primary key...")
 	}
-	// _, err := db.Exec("-- CREATE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);")
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txs_substring_idx ON txs(substring(txid for 8));"); err != nil {
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'block_txs' AND constraint_name = 'block_txs_pkey') THEN
+            ALTER TABLE block_txs ADD CONSTRAINT block_txs_pkey PRIMARY KEY(block_id, n);
+         END IF;
+       END
+       $$;`); err != nil {
 		return err
 	}
-	// Expression indexes require analyze?
-	//log.Printf("  - analyzing txs table...")
-	//_, err := db.Exec("ANALYZE txs;")
+	if verbose {
+		log.Printf("  - block_txs tx_id index...")
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS block_txs_tx_id_idx ON block_txs(tx_id);"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createIndexes2(db *sql.DB, verbose bool) error {
 	if verbose {
 		log.Printf("  - txins primary key...")
 	}
@@ -673,22 +763,37 @@ func createIndexes(db *sql.DB, verbose bool) error {
 
 func createConstraints(db *sql.DB, verbose bool) error {
 	if verbose {
-		log.Printf("  - txs block_id foreign key...")
+		log.Printf("  - block_txs block_id foreign key...")
 	}
 	if _, err := db.Exec(`
-       DO $$
-       BEGIN
-         -- NB: table_name is the target/foreign table
-         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-                         WHERE table_name = 'blocks' AND constraint_name = 'txs_block_id_fkey') THEN
-           ALTER TABLE txs ADD CONSTRAINT txs_block_id_fkey FOREIGN KEY (block_id) REFERENCES blocks(id);
-         END IF;
-       END
-       $$;`); err != nil {
+	   DO $$
+	   BEGIN
+	     -- NB: table_name is the target/foreign table
+	     IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+	                     WHERE table_name = 'blocks' AND constraint_name = 'block_txs_block_id_fkey') THEN
+	       ALTER TABLE block_txs ADD CONSTRAINT block_txs_block_id_fkey FOREIGN KEY (block_id) REFERENCES blocks(id);
+	     END IF;
+	   END
+	   $$;`); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txsins tx_id foreign key...")
+		log.Printf("  - block_txs tx_id foreign key...")
+	}
+	if _, err := db.Exec(`
+	   DO $$
+	   BEGIN
+	     -- NB: table_name is the target/foreign table
+	     IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+	                     WHERE table_name = 'txs' AND constraint_name = 'block_txs_tx_id_fkey') THEN
+	       ALTER TABLE block_txs ADD CONSTRAINT block_txs_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
+	     END IF;
+	   END
+	   $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txins tx_id foreign key...")
 	}
 	if _, err := db.Exec(`
        DO $$
@@ -703,7 +808,7 @@ func createConstraints(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txsins tx_id foreign key...")
+		log.Printf("  - txouts tx_id foreign key...")
 	}
 	if _, err := db.Exec(`
        DO $$
@@ -720,36 +825,15 @@ func createConstraints(db *sql.DB, verbose bool) error {
 	return nil
 }
 
-// NB: Computing height is not as simple as just figuring the row
-// number. The chain may contain splits, i.e. it is possible for more
-// than one block to have the same prevhash. The height is the height
-// or the prevhash block incremented by 1. This is where WITH
-// RECURSIVE comes in very handy.
-func computeHeights(db *sql.DB) error {
-	if _, err := db.Exec(`
-UPDATE blocks
-   SET height = a.h, prev = a.id
-  FROM (
-    WITH RECURSIVE recur(id, h, hash) AS (
-      SELECT id, 0 as h, hash
-        FROM blocks
-        WHERE prevhash = E'\\x0000000000000000000000000000000000000000000000000000000000000000'
-      UNION ALL
-      SELECT blocks.id, h+1 AS h, blocks.hash
-        FROM recur
-        JOIN blocks ON blocks.prevhash = recur.hash
-    )
-    SELECT id, h, hash FROM recur
-  ) a
-  WHERE blocks.id = a.id;
-       `); err != nil {
-		return err
-	}
-	return nil
-}
-
 // Set the orphan status starting from the highest block and going
 // backwards, up to limit. If limit is 0, the whole table is updated.
+//
+// The WITH RECURSIVE part connects rows by joining prevhash to hash,
+// thereby building a list which starts at the highest hight and going
+// towards the beginning until no parent can be found.
+//
+// Then we LEFT JOIN the above to the blocks table, and where there is
+// no match (x.id IS NULL) we mark it as orphan.
 func setOrphans(db *sql.DB, limit int) error {
 	var limitSql string
 	if limit > 0 {
@@ -779,6 +863,58 @@ UPDATE blocks
    ) a
   WHERE blocks.id = a.id;
        `, limitSql)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Most of the prevout_tx_id's should be already set during the
+// import, but we need to correct the remaining ones. This is a fairly
+// costly operation as it requires a txins table scan.
+func fixPrevoutTxId(db *sql.DB) error {
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         -- existence of txins_pkey means it is already done
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txs' AND constraint_name = 'txins_tx_id_fkey') THEN
+           UPDATE txins i
+              SET prevout_tx_id = t.id
+             FROM txs t
+            WHERE i.prevout_hash = t.txid
+              AND i.prevout_tx_id IS NULL
+              AND i.n <> -1;
+
+         END IF;
+       END
+       $$`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// This populates spend_tx_id so that we can see which outputs are
+// spent and by which inputs. The most efficient way of doing this
+// insanely massive operation is to create a new table, updating the
+// existing one will take an eternity. This will probably materialize
+// a temp table, and that seems like the fastest way.
+func markSpentOutputs(db *sql.DB) error {
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         -- existence of txouts_pkey means it is already done
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txouts' AND constraint_name = 'txouts_pkey') THEN
+           CREATE TABLE txouts_tmp AS
+             SELECT o.tx_id, o.n, o.value, o.scriptpubkey, i.tx_id AS spend_tx_id, i.n AS spend_n
+               FROM txouts o
+               LEFT JOIN txins i
+                      ON i.prevout_tx_id = o.tx_id AND i.prevout_n = o.n;
+           DROP TABLE txouts;
+           ALTER TABLE txouts_tmp RENAME TO txouts;
+         END IF;
+       END
+       $$;`); err != nil {
 		return err
 	}
 	return nil

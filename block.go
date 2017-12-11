@@ -1,7 +1,6 @@
 package blkchain
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 )
@@ -15,21 +14,6 @@ type Block struct {
 	Magic uint32
 	*BlockHeader
 	Txs TxList
-}
-
-type BlockHeader struct {
-	Version        uint32
-	PrevHash       Uint256
-	HashMerkleRoot Uint256
-	Time           uint32
-	Bits           uint32
-	Nonce          uint32
-}
-
-func (bh *BlockHeader) Hash() Uint256 {
-	buf := new(bytes.Buffer)
-	BinWrite(bh, buf)
-	return ShaSha256(buf.Bytes())
 }
 
 func (b *Block) BinRead(r io.Reader) error {

@@ -33,7 +33,7 @@ func (tx *Tx) BinRead(r io.Reader) (err error) {
 
 	if len(tx.TxIns) == 0 { // SegWit
 
-		flag, err := readVarInt(r)
+		flag, err := readCompactSize(r)
 		if err != nil {
 			return err
 		}

@@ -38,6 +38,15 @@ The importer creates a goroutine for each table and sends rows in
 parallel via channels. The mechanism by which it is written to
 postgres is `COPY`, which is by far the fastest method.
 
+For better performance PG docs [recommend](https://www.postgresql.org/docs/current/static/populate.html)
+setting maintenance_work_mem and max_wal_size higher, note that PG allows setting some options as part of
+the connect string, e.g.:
+
+```sh
+./import -blocks /path/to/blocks \
+         -connstr "host=192.168.1.15 dbname=btc maintenance_work_mem=4GB"
+```
+
 ### Catching up
 
 On subsequent runs import will query for the last block hash, and skip

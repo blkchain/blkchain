@@ -44,10 +44,10 @@ func BinWrite(s interface{}, w io.Writer) error {
 	return binary.Write(w, binary.LittleEndian, s)
 }
 
-func readVarInt(r io.Reader) (uint64, error) {
+func readCompactSize(r io.Reader) (uint64, error) {
 	var buf [8]byte
 
-	n, err := r.Read(buf[:1])
+	n, err := io.ReadFull(r, buf[:1])
 	if err != nil {
 		return 0, err
 	}
@@ -71,7 +71,7 @@ func readVarInt(r io.Reader) (uint64, error) {
 	return result, nil
 }
 
-func writeVarInt(i uint64, w io.Writer) (err error) {
+func writeCompactSize(i uint64, w io.Writer) (err error) {
 	if i < 0xfd {
 		_, err = w.Write([]byte{byte(i)})
 		return err
@@ -95,7 +95,7 @@ func writeVarInt(i uint64, w io.Writer) (err error) {
 }
 
 func readString(r io.Reader) ([]byte, error) {
-	size, err := readVarInt(r)
+	size, err := readCompactSize(r)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +110,7 @@ func readString(r io.Reader) ([]byte, error) {
 }
 
 func writeString(s []byte, w io.Writer) (err error) {
-	if err = writeVarInt(uint64(len(s)), w); err != nil {
+	if err = writeCompactSize(uint64(len(s)), w); err != nil {
 		return err
 	}
 	_, err = w.Write(s)
@@ -118,7 +118,7 @@ func writeString(s []byte, w io.Writer) (err error) {
 }
 
 func readList(r io.Reader, doRead func(io.Reader) error) error {
-	size, err := readVarInt(r)
+	size, err := readCompactSize(r)
 	if err != nil {
 		return err
 	}
@@ -132,7 +132,7 @@ func readList(r io.Reader, doRead func(io.Reader) error) error {
 }
 
 func writeList(w io.Writer, size int, doWrite func(io.Writer, int) error) error {
-	err := writeVarInt(uint64(size), w)
+	err := writeCompactSize(uint64(size), w)
 	if err != nil {
 		return err
 	}
@@ -143,4 +143,30 @@ func writeList(w io.Writer, size int, doWrite func(io.Writer, int) error) error 
 		}
 	}
 	return nil
+}
+
+// This is equivalent of serialize.h:ReadVarInt()
+// https://github.com/bitcoin/bitcoin/blob/0.15/src/serialize.h#L334
+// The origin of this encoding is not clear to me, it is similar to LEB128.
+// More info here: https://bitcoin.stackexchange.com/questions/51620/cvarint-serialization-format/51623
+func readVarInt(r io.Reader) (uint64, error) {
+	var n uint64
+	for {
+		var buf [1]byte
+		_, err := io.ReadFull(r, buf[:])
+		if err != nil {
+			return 0, err
+		}
+		// TODO - overflow check
+		n = (n << 7) | uint64(buf[0]&0x7F)
+		if (buf[0] & 0x80) != 0 {
+			// TODO - overflow check
+			n++
+		} else {
+			return n, nil
+		}
+
+	}
+	panic("unreachable")
+	return 0, nil
 }
