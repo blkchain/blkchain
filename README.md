@@ -1,13 +1,9 @@
 # blkchain
 
-This is a pile of Go code loosely aimed at doing blockchain stuff.
+This is a pile of Go code loosely aimed at doing blockchain stuff. Our
+first objective is to import the blockchain into Postgres.
 
-This is work-in-progress and is subject to a lot of changes..
-
-### Importing the blockchain into Postgres
-
-This is the first milestone of this project, indended to work in
-tandem with https://github.com/blkchain/pg_blkchain
+This is work-in-progress and is subject to a lot of changes.
 
 ### Source of blockchain data
 
@@ -20,32 +16,50 @@ You should be able to build `go build cmd/import/import.go` then run
 it with (Core should not be running):
 
 ```sh
-./import -blocks /path/to/blocks
+# Warning - this takes a long time
+./import \
+     -connstr "host=192.168.1.223 dbname=blocks sslmode=disable" \
+     -cache-size $((1048*1048*30)) \
+     -blocks /whataver/blocks
 ```
 
-This will read all blocks and upload them to Postgres. On a 2011
-thinkpad with a spinning hard drive running Linux, the whole import
-takes approximately 9 hours (~9,000 Tx/s), plus additional X hours to
-build the indexes and constraints.
+This will read all blocks and upload them to Postgres. The block
+descriptors are first read from leveldb block index, which contains
+file names and offsets to actual block data. Using the block index
+lets us read blocks in order which is essential for the correct
+setting of tx_id in outputs.
 
-On first run `import` will create the tables, initially without any
-indexes. This is as to keep the first import as fast as possible, the
-indexes and constraints will get created at the very end. It's
-important not to ctrl-C its first run, or else the indexes and
-constraints will never be created.
+There are two phases to this process, the first is just streaming the
+data into Postgres, the second is building indexes, verification,
+identifying spent outputs, etc. Each part takes hours. On not too
+fancy hardware we can stream ~10K transactions per second, the entire
+data transfer takes ~8 hours, then the index building phase takes
+about as much for a total of ~16 hours.
 
-The importer creates a goroutine for each table and sends rows in
-parallel via channels. The mechanism by which it is written to
-postgres is `COPY`, which is by far the fastest method.
+It helps a great deal if Postgres is well tuned and is running on fast
+hardware, especially a fast SSD is going to help a lot in the index
+building phase. If you use an SSD, remember to set `random_page_cost`
+to 1 or less. Setting `maintenance_work_mem` high should help building
+indexes faster. Note that it can be temporarily set right in the
+connection string (`-connstr "host=... maintenance_work_mem=2GB"`).
 
-For better performance PG docs [recommend](https://www.postgresql.org/docs/current/static/populate.html)
-setting maintenance_work_mem and max_wal_size higher, note that PG allows setting some options as part of
-the connect string, e.g.:
+The blockchain will occupy more than 300GB of space in Postgres, and
+realistically, including any temporary table operations you need at
+least 500GB.
 
-```sh
-./import -blocks /path/to/blocks \
-         -connstr "host=192.168.1.15 dbname=btc maintenance_work_mem=4GB"
-```
+The `-cache-size` parameter is the cache of txid (the SHA256) to the
+database tx_id, which import can set on the fly. This cache is also
+used to identify duplicate transactions. Having a cache of 30M entries
+achieves nearly 100% hit rate. The missing ids will be corrected
+later, but having as much as possible set from the beginning will
+reduce the time it takes to correct them later. A 30M entry cache will
+result in the import process being ~3GB.
+
+The initial data stream is done via `COPY`, with a separate goroutine
+streaming to its table. So we read blocks in order, iterate over the
+transactions therein, the transactions are split into inputs, outpus,
+etc, and each of those records is sent over a channel to the goroutine
+responsible for that table. This approach is very performant.
 
 ### Catching up
 
@@ -53,10 +67,8 @@ On subsequent runs import will query for the last block hash, and skip
 the blocks that are already in the database. This way it is possible
 to catch up as more data becomes available.
 
-This was only tested when Core is not running, running it while Core
-is writing to disk is probably not a good idea. You can speed up the
-skipping of blocks by giving it a `-start-idx` option, which is the
-number of the `blk*` file from which the scan starts.
+Since during the catch up all indexes and constraints are in place,
+inserting a transaction is much (nearly 10x) slower.
 
 ### Data Structure Notes
 
@@ -84,27 +96,18 @@ follow.
 
 Within the blockchain, transactions are referenced by their hashes,
 and that might seem like a natural way to do this, i.d. dispense with
-the "traditional" integer id and just use the hash as key.
+the "traditional" integer id and just use the hash as key. The tricky
+problem with that is that the hash depends on the transaction
+content. It is also 32 bytes long, which is relatively big and less
+performant when indexing. Therefore we use a `BIGINT` id for
+transactions.
 
-One (less obvious) problem is that transaction ids are not unique
-(`00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721`).
-
-Another problem is that the hash is 32 bytes, and that space adds up
-quickly, also building an index on a 32 byte BYTEA is slower and the
-index is unnecessarily large.
-
-#### Indexing the TX hashes
-
-One way to reduce the weight of the txid index is to only index the
-first few (8 seems like a good number) bytes. This is possible with
-_expression indexes_: `CREATE INDEX ON txs(substring(txid for 8))`. The
-catch is that we need to remember to always use the substring
-expression to look up transactions. A more significant problem is that
-an expression index cannot be used with `FOREIGN KEY`.
-
-Postgres documentation discourages use of _hash indexes_ because of
-implementation problems, though they theoretically seem well fit for
-this.
+It is not unusual for transactions to be included in more than one
+block during chain splits, in fact
+`e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb468`
+coinbase is actually used in two blocks, and this does not break the
+rules.  Transaction hashes are enforced unique, a transaction included
+in multiple blocks is still the same transaction.
 
 #### TX hash endian-ness
 
@@ -113,7 +116,7 @@ to a SHA256 hash which is just an array of bytes, but for whatever
 reason in Bitcoin code the hashes are treated as little-endian while
 printed as big-endian. So the above-mentioned duplicate TX hash is
 recorded in the database as
-`21d77ccb4c08386a04ac0196ae10f6a1d2c2a377558ca190f143070000000000`.
+`68b45f58b674e94eb881cd67b04c2cba07fe5552dbf1d5385637b0d4073dbfe3`
 This is consistent with on-disk storage in Core and the output of
 pgcrypto `digest()`. The disadvantage is that we need to remember to
 reverse the hashes when we look them up.

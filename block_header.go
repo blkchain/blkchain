@@ -2,7 +2,10 @@ package blkchain
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 )
 
 type BlockHeader struct {
@@ -92,4 +95,26 @@ func (ibh *IdxBlockHeader) BinRead(r io.Reader) (err error) {
 		return err
 	}
 	return nil
+}
+
+func (ibh *IdxBlockHeader) ReadBlock(blocksPath string, magic uint32) (*Block, error) {
+
+	path := filepath.Join(blocksPath, fmt.Sprintf("%s%05d.dat", "blk", int(ibh.FileN)))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("Opening file %v: %v", path, err)
+	}
+	defer f.Close()
+
+	pos := int64(ibh.DataPos) - 8 // magic + size = 8
+	if _, err := f.Seek(pos, 0); err != nil {
+		return nil, fmt.Errorf("Seeking to pos %d in file %v: %v", pos, path, err)
+	}
+
+	b := Block{Magic: magic}
+	if err := BinRead(&b, f); err != nil {
+		return nil, fmt.Errorf("Reading block: %v", err)
+	}
+
+	return &b, nil
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/blkchain/blkchain"
 )
@@ -16,6 +17,7 @@ func main() {
 	connStr := flag.String("connstr", "host=/var/run/postgresql dbname=blocks sslmode=disable", "Db connection string")
 	blocksPath := flag.String("blocks", "", "/path/to/blocks")
 	indexPath := flag.String("index", "", "/path/to/blocks/index (levelDb)")
+	chainStatePath := flag.String("chainstate", "", "/path/to/blocks/chainstate (levelDb UTXO set)")
 	testNet := flag.Bool("testnet", false, "Use testnet magic")
 	cacheSize := flag.Int("cache-size", 1024*1024*10, "Tx hashes to cache for pervout_tx_id")
 
@@ -29,6 +31,10 @@ func main() {
 		*indexPath = filepath.Join(*blocksPath, "index")
 	}
 
+	if *chainStatePath == "" {
+		*chainStatePath = filepath.Join(*blocksPath, "..", "chainstate")
+	}
+
 	var magic uint32
 	if *testNet {
 		magic = blkchain.TestNetMagic
@@ -36,76 +42,141 @@ func main() {
 		magic = blkchain.MainNetMagic
 	}
 
-	readBlocks(*connStr, *blocksPath, *indexPath, magic, *cacheSize)
+	if err := setRLimit(1024); err != nil { // LevelDb opens many files!
+		log.Printf("Error setting rlimit: %v", err)
+		return
+	}
+	processEverything(*connStr, *blocksPath, *indexPath, *chainStatePath, magic, *cacheSize)
 }
 
-func readBlocks(dbconnect, blocksPath, indexPath string, magic uint32, cacheSize int) {
+func processEverything(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int) {
 
 	log.Printf("Reading block headers from LevelDb (%s)...", indexPath)
-	bhs, err := blkchain.ReadBlockHeaderIndex(indexPath)
-	log.Printf("Read %d block headers.", len(bhs))
-	if len(bhs) == 0 {
+	bhs, err := blkchain.ReadBlockHeaderIndex(indexPath, blocksPath)
+	log.Printf("Read %d block headers.", bhs.Count())
+	if bhs.Count() == 0 {
 		log.Printf("Is Core running? Stop it first, and try again. Exiting.")
 		return
 	}
 
-	out, wg, err := blkchain.NewPGWriter(dbconnect, cacheSize)
+	writer, err := blkchain.NewPGWriter(dbconnect, cacheSize)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
 
-	interrupt := false
+	// monitor ctrl-c
+	interrupt := make(chan bool, 1)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	go func() {
 		<-sigCh
 		log.Printf("Interrupt, exiting scan loop...")
 		signal.Stop(sigCh)
-		interrupt = true
+		interrupt <- true
 	}()
 
-	for height := 0; height < len(bhs); height++ {
-		for _, bh := range bhs[height] {
+	if err := processBlocks(writer, bhs, blocksPath, magic, interrupt); err != nil {
+		log.Printf("Error processing blocks: %v", err)
+	}
 
-			path := filepath.Join(blocksPath, fmt.Sprintf("%s%05d.dat", "blk", int(bh.FileN)))
-			f, err := os.Open(path)
-			if err != nil {
-				log.Printf("Error opening file %v: %v", path, err)
-				continue
-			}
-
-			pos := int64(bh.DataPos) - 8 // magic + size = 8
-			_, err = f.Seek(pos, 0)
-			if err != nil {
-				log.Printf("Error seeking to pos %d in file %v: %v", pos, path, err)
-				f.Close()
-				continue
-			}
-
-			b := blkchain.Block{Magic: magic}
-			err = blkchain.BinRead(&b, f)
-			f.Close()
-
-			if err != nil {
-				log.Printf("Error reading block: %v", err)
-				continue
-			}
-
-			out <- &blkchain.BlockInfo{
-				Block:   &b,
-				Height:  int(bh.Height),
-				Status:  int(bh.Status),
-				FileN:   int(bh.FileN),
-				FilePos: int(bh.DataPos),
-			}
+	if len(interrupt) == 0 {
+		if err := processUTXOs(writer, chainStatePath, interrupt); err != nil {
+			log.Printf("Error processing UTXO set: %v", err)
 		}
-		if interrupt {
+	}
+
+	log.Printf("Closing channel, waiting for workers to finish...")
+	writer.Close()
+	log.Printf("All done.")
+}
+
+func processBlocks(writer *blkchain.PGWriter, bhs *blkchain.BlockHeaderIndex, blocksPath string, magic uint32, interrupt chan bool) error {
+	lastHeight, err := writer.LastHeight()
+	if err != nil {
+		return err
+	}
+	if lastHeight > 0 {
+		// lastHeight is correct, pgwriter will ignore the last block
+		// starting with lastHeight+1 risks skipping duplicates in
+		// case of a split
+		log.Printf("Starting with block height: %d", lastHeight)
+		bhs.Start(lastHeight)
+	}
+
+	for bhs.Next() {
+		bh := bhs.BlockHeader()
+		b, err := bh.ReadBlock(blocksPath, magic)
+		if err != nil {
+			log.Printf("Error: %v", err)
+			break
+		}
+		writer.WriteBlockInfo(&blkchain.BlockInfo{
+			Block:   b,
+			Height:  int(bh.Height),
+			Status:  int(bh.Status),
+			FileN:   int(bh.FileN),
+			FilePos: int(bh.DataPos),
+		})
+		if len(interrupt) > 0 {
+			break
+		}
+	}
+	return nil
+}
+
+func processUTXOs(writer *blkchain.PGWriter, chainStatePath string, interrupt chan bool) error {
+	log.Printf("Reading UTXO set from LevelDb (%s)...", chainStatePath)
+
+	csr, err := blkchain.NewChainStateReader(chainStatePath)
+	if err != nil {
+		return err
+	}
+	defer csr.Close()
+
+	n := 0
+	for csr.Next() {
+		u, err := csr.GetUTXO()
+		if err != nil {
+			return err
+		}
+
+		n++
+		writer.WriteUTXO(u)
+
+		if n%1000000 == 0 {
+			writer.WriteUTXO(nil) // commit signal
+		}
+
+		if len(interrupt) > 0 {
 			break
 		}
 	}
 
-	close(out)
-	log.Printf("Closed channel, waiting for workers to finish...")
-	wg.Wait()
-	log.Printf("All done.")
+	if err := csr.Error(); err != nil {
+		return err
+	}
+
+	log.Printf("Finished reading %d UTXOs.", n)
+	return nil
+}
+
+func setRLimit(required uint64) error {
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		return err
+	}
+	if rLimit.Cur < required {
+		log.Printf("Setting open files rlimit of %d to %d.", rLimit.Cur, required)
+		rLimit.Cur = required
+		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+			return err
+		}
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+			return err
+		}
+		if rLimit.Cur < required {
+			return fmt.Errorf("Could not change open files rlimit to: %d", required)
+		}
+	}
+	return nil
 }

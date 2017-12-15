@@ -25,7 +25,7 @@ type idOutCnt struct {
 // Use only the first N bytes to save memory
 const HASH_PREFIX_SIZE = 10
 
-const RECENT_RING_SIZE = 1024 * 16
+const RECENT_RING_SIZE = 1024 * 64
 
 type txIdCache struct {
 	*sync.Mutex
@@ -39,7 +39,7 @@ type txIdCache struct {
 	// The following is to not purge the N most recent
 	// transactions. This is necessary when we detect known
 	// transactions during chain splits.
-	recent map[[HASH_PREFIX_SIZE]byte]bool
+	recent map[[HASH_PREFIX_SIZE]byte]int64
 	ring   [][HASH_PREFIX_SIZE]byte
 	ring_n int
 }
@@ -53,7 +53,7 @@ func newTxIdCache(sz int) *txIdCache {
 		Mutex:  new(sync.Mutex),
 		m:      make(map[[HASH_PREFIX_SIZE]byte]*idOutCnt, alloc),
 		sz:     sz,
-		recent: make(map[[HASH_PREFIX_SIZE]byte]bool, RECENT_RING_SIZE),
+		recent: make(map[[HASH_PREFIX_SIZE]byte]int64, RECENT_RING_SIZE),
 		ring:   make([][HASH_PREFIX_SIZE]byte, RECENT_RING_SIZE),
 		ring_n: -1,
 	}
@@ -61,37 +61,41 @@ func newTxIdCache(sz int) *txIdCache {
 
 var zeroHashPrefix [HASH_PREFIX_SIZE]byte
 
-func (c *txIdCache) addRing(key [HASH_PREFIX_SIZE]byte) bool {
+// Returns cached id if it is recent, otherwise -1
+func (c *txIdCache) addRing(key [HASH_PREFIX_SIZE]byte, id int64) int64 {
 	c.Lock()
 
-	recent := c.recent[key]
+	result := int64(-1)
+
+	if hit, ok := c.recent[key]; ok {
+		result = hit
+		c.dups++
+	} else {
+		c.recent[key] = id
+	}
 
 	c.ring_n++
 	if c.ring_n == RECENT_RING_SIZE {
 		c.ring_n = 0
 	}
-	if c.ring[c.ring_n] != zeroHashPrefix {
+
+	if c.ring[c.ring_n] != zeroHashPrefix && result == -1 {
 		delete(c.recent, c.ring[c.ring_n])
 	}
-	c.ring[c.ring_n] = key
-	c.recent[key] = true
 
-	if recent {
-		c.dups++
-	}
+	c.ring[c.ring_n] = key
+
 	c.Unlock()
-	return recent
+	return result
 }
 
 func (c *txIdCache) checkSize() {
 	// NB: locking is up to caller!
 	if len(c.m) == c.sz {
-		// remove a random entry, but not if it is recent
+		// remove a random entry
 		for k, _ := range c.m {
-			if !c.recent[k] {
-				delete(c.m, k)
-				break
-			}
+			delete(c.m, k)
+			break
 		}
 	}
 }
@@ -103,19 +107,19 @@ func (c *txIdCache) add(hash Uint256, id int64, cnt int) int64 {
 	)
 	copy(key[:], hash[:HASH_PREFIX_SIZE])
 
-	if c.addRing(key) { // true if this is a recent transaction
-		c.Lock()
-		result = c.m[key].id
-		c.Unlock()
+	if recent := c.addRing(key, id); recent != -1 { // true if this is a recent transaction
+		result = recent
 	} else {
 		c.Lock()
 
 		c.checkSize()
 
 		if hit, ok := c.m[key]; ok {
-			// A collision, this should never happen!
+			// If we got this far, it means that a hash is not recent
+			// was a duplicate. This may be a collision, though it is
+			// highly improbable.
 			c.cols++
-			log.Printf("ZZZ collision at hash: %s", hash)
+			log.Printf("WARNING: Txid possible cache collision at hash: %s", hash)
 			result = hit.id
 		} else {
 			c.m[key] = &idOutCnt{id, uint16(cnt)}

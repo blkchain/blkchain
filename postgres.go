@@ -40,6 +40,7 @@ type txRec struct {
 	tx      *Tx
 	hash    Uint256
 	sync    chan bool
+	dupe    bool // already seen
 }
 
 type txInRec struct {
@@ -63,13 +64,20 @@ type BlockInfo struct {
 	FilePos int
 }
 
-func NewPGWriter(connstr string, cacheSize int) (chan *BlockInfo, *sync.WaitGroup, error) {
+type PGWriter struct {
+	blockCh chan *BlockInfo
+	utxoCh  chan *UTXO
+	wg      *sync.WaitGroup
+	db      *sql.DB
+}
+
+func NewPGWriter(connstr string, cacheSize int) (*PGWriter, error) {
 
 	var wg sync.WaitGroup
 
 	db, err := sql.Open("postgres", connstr)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	deferredIndexes := true
@@ -79,23 +87,49 @@ func NewPGWriter(connstr string, cacheSize int) (chan *BlockInfo, *sync.WaitGrou
 			deferredIndexes = false
 		} else {
 			log.Printf("Tables created without indexes, which are created at the very end.")
-			return nil, nil, err
+			return nil, err
 		}
 	}
 
-	ch := make(chan *BlockInfo, 64)
-	go pgBlockWorker(ch, &wg, db, deferredIndexes, cacheSize)
+	bch := make(chan *BlockInfo, 64)
+	wg.Add(1)
+	go pgBlockWorker(bch, &wg, db, deferredIndexes, cacheSize)
 
-	return ch, &wg, nil
+	uch := make(chan *UTXO, 64)
+	wg.Add(1)
+	go pgUTXOWriter(uch, &wg, db)
+
+	return &PGWriter{
+		blockCh: bch,
+		utxoCh:  uch,
+		wg:      &wg,
+		db:      db,
+	}, nil
+}
+
+func (p *PGWriter) Close() {
+	close(p.blockCh)
+	close(p.utxoCh)
+	p.wg.Wait()
+}
+
+func (p *PGWriter) WriteBlockInfo(b *BlockInfo) {
+	p.blockCh <- b
+}
+
+func (p *PGWriter) WriteUTXO(u *UTXO) {
+	p.utxoCh <- u
+}
+
+func (w *PGWriter) LastHeight() (int, error) {
+	_, height, _, err := getLastHashAndHeight(w.db)
+	return height, err
 }
 
 func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int) {
-
-	wg.Add(1)
 	defer wg.Done()
 
-	bid, height, bhash, err := getLastHashAndHeight(db)
-	_ = height
+	bid, _, bhash, err := getLastHashAndHeight(db)
 	if err != nil {
 		log.Printf("Error getting last hash and height, exiting: %v", err)
 		return
@@ -176,17 +210,14 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 
 			// Check if recently seen and add to cache.
 			recentId := idCache.add(hash, txid, len(tx.TxOuts))
-
-			if recentId == txid {
-				// This is a not recently seen transaction
-				txCh <- &txRec{
-					id:      txid,
-					n:       n,
-					blockId: bid,
-					tx:      tx,
-					hash:    hash,
-					sync:    syncCh,
-				}
+			txCh <- &txRec{
+				id:      recentId,
+				n:       n,
+				blockId: bid,
+				tx:      tx,
+				hash:    hash,
+				sync:    syncCh,
+				dupe:    recentId != txid,
 			}
 
 			if syncCh != nil {
@@ -231,7 +262,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 
 		// report progress
 		if time.Now().Sub(last) > 5*time.Second {
-			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f\n",
+			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f",
 				bi.Height, txcnt, time.Unix(int64(bi.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
 			last = time.Now()
 		}
@@ -255,16 +286,25 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 	if err := createIndexes1(db, verbose); err != nil {
 		log.Printf("Error creating indexes: %v", err)
 	}
-	log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
-	if err := fixPrevoutTxId(db); err != nil {
-		log.Printf("Error fixing prevout_tx_id: %v", err)
+	if idCache.miss > 0 {
+		log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
+		if err := fixPrevoutTxId(db); err != nil {
+			log.Printf("Error fixing prevout_tx_id: %v", err)
+		}
+	} else {
+		log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
+
 	}
-	log.Printf("Marking spent outputs (if needed), this may take a *really* long time (hours)...")
-	if err := markSpentOutputs(db); err != nil {
-		log.Printf("Error fixing prevout_tx_id: %v", err)
+	// log.Printf("Marking spent outputs (if needed), this may take a *really* long time (hours)...")
+	// if err := markSpentOutputs(db); err != nil {
+	// 	log.Printf("Error fixing prevout_tx_id: %v", err)
+	// }
+	log.Printf("Linking UTXOs (if needed), this may take a long time...")
+	if err := linkUTXOs(db); err != nil {
+		log.Printf("Error linking utxos: %v", err)
 	}
 	log.Printf("Creating indexes part 2 (if needed), please be patient, this may take a long time...")
-	if err := createIndexes1(db, verbose); err != nil {
+	if err := createIndexes2(db, verbose); err != nil {
 		log.Printf("Error creating indexes: %v", err)
 	}
 	log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
@@ -390,15 +430,20 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			continue
 		}
 
-		t := tr.tx
-		_, err = stmt.Exec(
-			tr.id,
-			tr.hash[:],
-			int32(t.Version),
-			int32(t.LockTime),
-		)
-		if err != nil {
-			log.Printf("ERROR (7): %v", err)
+		if !tr.dupe {
+			t := tr.tx
+			_, err = stmt.Exec(
+				tr.id,
+				tr.hash[:],
+				int32(t.Version),
+				int32(t.LockTime),
+			)
+			if err != nil {
+				log.Printf("ERROR (7): %v", err)
+			}
+			// It can still be a dupe if we are catching up and the
+			// cache is empty. In which case we will get a Tx commit
+			// error below, which is fine.
 		}
 
 		_, err = bstmt.Exec(
@@ -539,6 +584,58 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB) {
 	}
 }
 
+func pgUTXOWriter(c chan *UTXO, wg *sync.WaitGroup, db *sql.DB) {
+	defer wg.Done()
+
+	cols := []string{"txid", "n", "height", "coinbase", "value", "scriptpubkey"}
+
+	txn, stmt, err := begin(db, "utxos", cols)
+	if err != nil {
+		log.Printf("ERROR (13): %v", err)
+	}
+
+	count := 0
+	last, start := time.Now(), time.Now()
+	for u := range c {
+
+		if u == nil { // commit signal
+			if err = commit(stmt, txn); err != nil {
+				log.Printf("UTXO commit error: %v", err)
+			}
+			txn, stmt, err = begin(db, "utxos", cols)
+			if err != nil {
+				log.Printf("ERROR (14): %v", err)
+			}
+			continue
+		}
+
+		_, err = stmt.Exec(
+			u.Hash[:],
+			u.N,
+			u.Height,
+			u.Coinbase,
+			u.Value,
+			u.ScriptPubKey,
+		)
+		if err != nil {
+			log.Printf("ERROR (15): %v\n", err)
+		}
+		count++
+
+		// report progress
+		if time.Now().Sub(last) > 5*time.Second {
+			log.Printf("UTXOs: %d, rows/s: %02f",
+				count, float64(count)/time.Now().Sub(start).Seconds())
+			last = time.Now()
+		}
+	}
+
+	log.Printf("UTXO writer channel closed, leaving.")
+	if err = commit(stmt, txn); err != nil {
+		log.Printf("UTXO commit error: %v", err)
+	}
+}
+
 func commit(stmt *sql.Stmt, txn *sql.Tx) (err error) {
 	_, err = stmt.Exec()
 	if err != nil {
@@ -616,7 +713,7 @@ func createTables(db *sql.DB) error {
 
   CREATE TABLE txs (
    id            BIGSERIAL
-  ,txid          BYTEA NOT NULL -- the hash, cannot be unique
+  ,txid          BYTEA NOT NULL
   ,version       INT NOT NULL
   ,locktime      INT NOT NULL
   );
@@ -643,8 +740,16 @@ func createTables(db *sql.DB) error {
   ,n            INT NOT NULL
   ,value        BIGINT NOT NULL
   ,scriptpubkey BYTEA NOT NULL
-  ,spend_tx_id  BIGINT
-  ,spend_n      INT
+  );
+
+  CREATE TABLE utxos (
+   tx_id        BIGINT         -- NOT NULL
+  ,txid         BYTEA NOT NULL
+  ,n            INT NOT NULL
+  ,height       INT NOT NULL
+  ,coinbase     BOOL NOT NULL
+  ,value        BIGINT NOT NULL
+  ,scriptpubkey BYTEA NOT NULL
   );
 `
 	_, err := db.Exec(sqlTables)
@@ -702,7 +807,7 @@ func createIndexes1(db *sql.DB, verbose bool) error {
 	if verbose {
 		log.Printf("  - txs txid (hash) index...")
 	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);"); err != nil {
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);"); err != nil {
 		return err
 	}
 	if verbose {
@@ -729,6 +834,27 @@ func createIndexes1(db *sql.DB, verbose bool) error {
 }
 
 func createIndexes2(db *sql.DB, verbose bool) error {
+	if verbose {
+		log.Printf("  - utxos primary key...")
+	}
+	if _, err := db.Exec(`
+	   DO $$
+	   BEGIN
+	     IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+	                     WHERE table_name = 'utxos' AND constraint_name = 'utxos_pkey') THEN
+            ALTER TABLE utxos ALTER COLUMN tx_id SET NOT NULL;
+	        ALTER TABLE utxos ADD CONSTRAINT utxos_pkey PRIMARY KEY(tx_id, n);
+	     END IF;
+	   END
+	   $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  - txins (prevout_tx_id, prevout_tx_n) index...")
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txins_prevout_tx_id_prevout_n_idx ON txins(prevout_tx_id, prevout_n);"); err != nil {
+		return err
+	}
 	if verbose {
 		log.Printf("  - txins primary key...")
 	}
@@ -822,9 +948,26 @@ func createConstraints(db *sql.DB, verbose bool) error {
        $$;`); err != nil {
 		return err
 	}
+	if verbose {
+		log.Printf("  - utxos tx_id,n foreign key...")
+	}
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         -- NB: table_name is the target/foreign table
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txouts' AND constraint_name = 'utxos_tx_id_n_fkey') THEN
+           ALTER TABLE utxos ADD CONSTRAINT utxos_tx_id_n_fkey FOREIGN KEY (tx_id, n) REFERENCES txouts(tx_id, n);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
 	return nil
 }
 
+// TODO: We already take care of this in leveldb.go?
+//
 // Set the orphan status starting from the highest block and going
 // backwards, up to limit. If limit is 0, the whole table is updated.
 //
@@ -893,25 +1036,46 @@ func fixPrevoutTxId(db *sql.DB) error {
 	return nil
 }
 
-// This populates spend_tx_id so that we can see which outputs are
-// spent and by which inputs. The most efficient way of doing this
-// insanely massive operation is to create a new table, updating the
-// existing one will take an eternity. This will probably materialize
-// a temp table, and that seems like the fastest way.
-func markSpentOutputs(db *sql.DB) error {
+// // This populates spent column so that we can see that an output is
+// // spent. The most efficient way of doing this insanely massive
+// // operation is to create a new table, updating the existing one will
+// // take an eternity.
+// func markSpentOutputs(db *sql.DB) error {
+// 	if _, err := db.Exec(`
+//        DO $$
+//        BEGIN
+//          -- existence of txouts_pkey means it is already done
+//          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+//                          WHERE table_name = 'txouts' AND constraint_name = 'txouts_pkey') THEN
+//            CREATE TABLE txouts_tmp AS
+//              SELECT o.tx_id, o.n, o.value, o.scriptpubkey, i.prevout_tx_id IS NOT NULL AS spent
+//                FROM txouts o
+//                LEFT JOIN txins i
+//                       ON i.prevout_tx_id = o.tx_id AND i.prevout_n = o.n;
+//            DROP TABLE txouts;
+//            ALTER TABLE txouts_tmp RENAME TO txouts;
+//          END IF;
+//        END
+//        $$;`); err != nil {
+// 		return err
+// 	}
+// 	return nil
+// }
+
+// Link UTXOs to transactions
+func linkUTXOs(db *sql.DB) error {
 	if _, err := db.Exec(`
        DO $$
        BEGIN
          -- existence of txouts_pkey means it is already done
          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-                         WHERE table_name = 'txouts' AND constraint_name = 'txouts_pkey') THEN
-           CREATE TABLE txouts_tmp AS
-             SELECT o.tx_id, o.n, o.value, o.scriptpubkey, i.tx_id AS spend_tx_id, i.n AS spend_n
-               FROM txouts o
-               LEFT JOIN txins i
-                      ON i.prevout_tx_id = o.tx_id AND i.prevout_n = o.n;
-           DROP TABLE txouts;
-           ALTER TABLE txouts_tmp RENAME TO txouts;
+                         WHERE table_name = 'utxos' AND constraint_name = 'utxos_pkey') THEN
+           CREATE TABLE utxos_tmp AS
+             SELECT t.id AS tx_id, u.txid, u.n, u.height, u.coinbase, u.value, u.scriptpubkey
+               FROM utxos u
+               JOIN txs t ON t.txid = u.txid;
+           DROP TABLE utxos;
+           ALTER TABLE utxos_tmp RENAME TO utxos;
          END IF;
        END
        $$;`); err != nil {

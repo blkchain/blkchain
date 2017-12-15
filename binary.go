@@ -170,3 +170,27 @@ func readVarInt(r io.Reader) (uint64, error) {
 	panic("unreachable")
 	return 0, nil
 }
+
+// https://github.com/bitcoin/bitcoin/blob/0.15/src/serialize.h#L317
+func writeVarInt(n uint64, w io.Writer) (err error) {
+	buf := make([]byte, 10)
+	len := 0
+	for {
+		if len == 0 {
+			buf[len] = byte(n) & 0x7F
+		} else {
+			buf[len] = byte(n)&0x7F | 0x80
+		}
+		if n <= 0x7F {
+			break
+		}
+		n = (n >> 7) - 1
+		len++
+	}
+	for i := len; i > 0; i-- {
+		if _, err := w.Write([]byte{byte(buf[i])}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
