@@ -29,9 +29,15 @@ func (o *DbOutPoint) BinRead(r io.Reader) error {
 	return nil
 }
 
-// func (o *DbOutPoint) BinWrite(w io.Writer) error {
-// 	// ZZZ
-// }
+func (o *DbOutPoint) BinWrite(w io.Writer) error {
+	if err := BinWrite(o.Hash, w); err != nil {
+		return err
+	}
+	if err := writeVarInt(uint64(o.N), w); err != nil {
+		return err
+	}
+	return nil
+}
 
 // Note that the OutPoint is not read here
 func (u *UTXO) BinRead(r io.Reader) (err error) {

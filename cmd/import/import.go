@@ -59,7 +59,13 @@ func processEverything(dbconnect, blocksPath, indexPath, chainStatePath string, 
 		return
 	}
 
-	writer, err := blkchain.NewPGWriter(dbconnect, cacheSize)
+	utxo, err := blkchain.NewChainStateChecker(chainStatePath)
+	if err != nil {
+		log.Fatalf("ERROR: %v", err)
+	}
+	defer utxo.Close()
+
+	writer, err := blkchain.NewPGWriter(dbconnect, cacheSize, utxo)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
@@ -79,11 +85,12 @@ func processEverything(dbconnect, blocksPath, indexPath, chainStatePath string, 
 		log.Printf("Error processing blocks: %v", err)
 	}
 
-	if len(interrupt) == 0 {
-		if err := processUTXOs(writer, chainStatePath, interrupt); err != nil {
-			log.Printf("Error processing UTXO set: %v", err)
-		}
-	}
+	// ZZZ
+	// if len(interrupt) == 0 {
+	// 	if err := processUTXOs(writer, chainStatePath, interrupt); err != nil {
+	// 		log.Printf("Error processing UTXO set: %v", err)
+	// 	}
+	// }
 
 	log.Printf("Closing channel, waiting for workers to finish...")
 	writer.Close()
@@ -124,10 +131,11 @@ func processBlocks(writer *blkchain.PGWriter, bhs *blkchain.BlockHeaderIndex, bl
 	return nil
 }
 
+// TODO unused
 func processUTXOs(writer *blkchain.PGWriter, chainStatePath string, interrupt chan bool) error {
 	log.Printf("Reading UTXO set from LevelDb (%s)...", chainStatePath)
 
-	csr, err := blkchain.NewChainStateReader(chainStatePath)
+	csr, err := blkchain.NewChainStateIterator(chainStatePath)
 	if err != nil {
 		return err
 	}

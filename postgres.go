@@ -53,6 +53,7 @@ type txInRec struct {
 type txOutRec struct {
 	txId  int64
 	n     int
+	hash  Uint256
 	txOut *TxOut
 }
 
@@ -71,7 +72,11 @@ type PGWriter struct {
 	db      *sql.DB
 }
 
-func NewPGWriter(connstr string, cacheSize int) (*PGWriter, error) {
+type isUTXOer interface {
+	IsUTXO(Uint256, uint32) (bool, error)
+}
+
+func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error) {
 
 	var wg sync.WaitGroup
 
@@ -93,7 +98,7 @@ func NewPGWriter(connstr string, cacheSize int) (*PGWriter, error) {
 
 	bch := make(chan *BlockInfo, 64)
 	wg.Add(1)
-	go pgBlockWorker(bch, &wg, db, deferredIndexes, cacheSize)
+	go pgBlockWorker(bch, &wg, db, deferredIndexes, cacheSize, utxo)
 
 	uch := make(chan *UTXO, 64)
 	wg.Add(1)
@@ -126,7 +131,7 @@ func (w *PGWriter) LastHeight() (int, error) {
 	return height, err
 }
 
-func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int) {
+func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int, utxo isUTXOer) {
 	defer wg.Done()
 
 	bid, _, bhash, err := getLastHashAndHeight(db)
@@ -150,7 +155,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 	go pgTxInWriter(txInCh, db)
 
 	txOutCh := make(chan *txOutRec, 64)
-	go pgTxOutWriter(txOutCh, db)
+	go pgTxOutWriter(txOutCh, db, utxo)
 
 	writerWg.Add(4)
 
@@ -542,10 +547,10 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 	}
 }
 
-func pgTxOutWriter(c chan *txOutRec, db *sql.DB) {
+func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 	defer writerWg.Done()
 
-	cols := []string{"tx_id", "n", "value", "scriptpubkey"}
+	cols := []string{"tx_id", "n", "value", "scriptpubkey", "spent"}
 
 	txn, stmt, err := begin(db, "txouts", cols)
 	if err != nil {
@@ -565,15 +570,21 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB) {
 			continue
 		}
 
+		spent, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
+		if err != nil {
+			log.Printf("ERROR (13.5): %v", err)
+		}
+
 		t := tr.txOut
 		_, err = stmt.Exec(
 			tr.txId,
 			tr.n,
 			t.Value,
 			t.ScriptPubKey,
+			spent,
 		)
 		if err != nil {
-			log.Printf("ERROR (11): %v\n", err)
+			log.Printf("ERROR (13.6): %v\n", err)
 		}
 
 	}
@@ -591,7 +602,7 @@ func pgUTXOWriter(c chan *UTXO, wg *sync.WaitGroup, db *sql.DB) {
 
 	txn, stmt, err := begin(db, "utxos", cols)
 	if err != nil {
-		log.Printf("ERROR (13): %v", err)
+		log.Printf("ERROR (13.7): %v", err)
 	}
 
 	count := 0
@@ -740,8 +751,10 @@ func createTables(db *sql.DB) error {
   ,n            INT NOT NULL
   ,value        BIGINT NOT NULL
   ,scriptpubkey BYTEA NOT NULL
+  ,spent        BOOL NOT NULL
   );
 
+  -- ZZZ unused
   CREATE TABLE utxos (
    tx_id        BIGINT         -- NOT NULL
   ,txid         BYTEA NOT NULL
@@ -1062,6 +1075,7 @@ func fixPrevoutTxId(db *sql.DB) error {
 // 	return nil
 // }
 
+// ZZZ unused
 // Link UTXOs to transactions
 func linkUTXOs(db *sql.DB) error {
 	if _, err := db.Exec(`

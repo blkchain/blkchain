@@ -187,7 +187,7 @@ func writeVarInt(n uint64, w io.Writer) (err error) {
 		n = (n >> 7) - 1
 		len++
 	}
-	for i := len; i > 0; i-- {
+	for i := len; i >= 0; i-- {
 		if _, err := w.Write([]byte{byte(buf[i])}); err != nil {
 			return err
 		}

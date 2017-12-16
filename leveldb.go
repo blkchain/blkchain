@@ -120,7 +120,7 @@ type ChainStateReader struct {
 	iterator.Iterator
 }
 
-func NewChainState(path string) (*ChainStateReader, error) {
+func NewChainStateChecker(path string) (*ChainStateReader, error) {
 	db, err := leveldb.OpenFile(path, &opt.Options{ReadOnly: true})
 	if err != nil {
 		return nil, err
@@ -128,20 +128,18 @@ func NewChainState(path string) (*ChainStateReader, error) {
 	return &ChainStateReader{db, nil}, nil
 }
 
-// func (r *ChainStateReader) GetUTXO(hash Uint256, n uint32) (*UTXO, error) {
-// 	var u UTXO
+func (r *ChainStateReader) IsUTXO(hash Uint256, n uint32) (bool, error) {
+	var buf [40]byte
+	w := bytes.NewBuffer(buf[:])
+	w.WriteByte('C')
+	if err := BinWrite(&DbOutPoint{hash, n}, w); err != nil {
+		return false, err
+	}
+	return r.Has(w.Bytes(), nil)
+}
 
-// 	if err := BinRead(&u.DbOutPoint, bytes.NewReader(r.Key()[1:])); err != nil {
-// 		return nil, err
-// 	}
-// 	if err := BinRead(&u, bytes.NewReader(r.Value())); err != nil {
-// 		return nil, err
-// 	}
-// 	return &u, nil
-// }
-
-// ZZZ
-func NewChainStateReader(path string) (*ChainStateReader, error) {
+// TODO unused
+func NewChainStateIterator(path string) (*ChainStateReader, error) {
 	db, err := leveldb.OpenFile(path, &opt.Options{ReadOnly: true})
 	if err != nil {
 		return nil, err
@@ -150,7 +148,7 @@ func NewChainStateReader(path string) (*ChainStateReader, error) {
 	return &ChainStateReader{db, iter}, nil
 }
 
-// ZZZ
+// TODO unused
 func (r *ChainStateReader) GetUTXO() (*UTXO, error) {
 	var u UTXO
 	if err := BinRead(&u.DbOutPoint, bytes.NewReader(r.Key()[1:])); err != nil {
