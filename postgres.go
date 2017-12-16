@@ -67,7 +67,6 @@ type BlockInfo struct {
 
 type PGWriter struct {
 	blockCh chan *BlockInfo
-	utxoCh  chan *UTXO
 	wg      *sync.WaitGroup
 	db      *sql.DB
 }
@@ -100,13 +99,8 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 	wg.Add(1)
 	go pgBlockWorker(bch, &wg, db, deferredIndexes, cacheSize, utxo)
 
-	uch := make(chan *UTXO, 64)
-	wg.Add(1)
-	go pgUTXOWriter(uch, &wg, db)
-
 	return &PGWriter{
 		blockCh: bch,
-		utxoCh:  uch,
 		wg:      &wg,
 		db:      db,
 	}, nil
@@ -114,16 +108,11 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 
 func (p *PGWriter) Close() {
 	close(p.blockCh)
-	close(p.utxoCh)
 	p.wg.Wait()
 }
 
 func (p *PGWriter) WriteBlockInfo(b *BlockInfo) {
 	p.blockCh <- b
-}
-
-func (p *PGWriter) WriteUTXO(u *UTXO) {
-	p.utxoCh <- u
 }
 
 func (w *PGWriter) LastHeight() (int, error) {
@@ -299,14 +288,6 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 	} else {
 		log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
 
-	}
-	// log.Printf("Marking spent outputs (if needed), this may take a *really* long time (hours)...")
-	// if err := markSpentOutputs(db); err != nil {
-	// 	log.Printf("Error fixing prevout_tx_id: %v", err)
-	// }
-	log.Printf("Linking UTXOs (if needed), this may take a long time...")
-	if err := linkUTXOs(db); err != nil {
-		log.Printf("Error linking utxos: %v", err)
 	}
 	log.Printf("Creating indexes part 2 (if needed), please be patient, this may take a long time...")
 	if err := createIndexes2(db, verbose); err != nil {
@@ -595,58 +576,6 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 	}
 }
 
-func pgUTXOWriter(c chan *UTXO, wg *sync.WaitGroup, db *sql.DB) {
-	defer wg.Done()
-
-	cols := []string{"txid", "n", "height", "coinbase", "value", "scriptpubkey"}
-
-	txn, stmt, err := begin(db, "utxos", cols)
-	if err != nil {
-		log.Printf("ERROR (13.7): %v", err)
-	}
-
-	count := 0
-	last, start := time.Now(), time.Now()
-	for u := range c {
-
-		if u == nil { // commit signal
-			if err = commit(stmt, txn); err != nil {
-				log.Printf("UTXO commit error: %v", err)
-			}
-			txn, stmt, err = begin(db, "utxos", cols)
-			if err != nil {
-				log.Printf("ERROR (14): %v", err)
-			}
-			continue
-		}
-
-		_, err = stmt.Exec(
-			u.Hash[:],
-			u.N,
-			u.Height,
-			u.Coinbase,
-			u.Value,
-			u.ScriptPubKey,
-		)
-		if err != nil {
-			log.Printf("ERROR (15): %v\n", err)
-		}
-		count++
-
-		// report progress
-		if time.Now().Sub(last) > 5*time.Second {
-			log.Printf("UTXOs: %d, rows/s: %02f",
-				count, float64(count)/time.Now().Sub(start).Seconds())
-			last = time.Now()
-		}
-	}
-
-	log.Printf("UTXO writer channel closed, leaving.")
-	if err = commit(stmt, txn); err != nil {
-		log.Printf("UTXO commit error: %v", err)
-	}
-}
-
 func commit(stmt *sql.Stmt, txn *sql.Tx) (err error) {
 	_, err = stmt.Exec()
 	if err != nil {
@@ -753,17 +682,6 @@ func createTables(db *sql.DB) error {
   ,scriptpubkey BYTEA NOT NULL
   ,spent        BOOL NOT NULL
   );
-
-  -- ZZZ unused
-  CREATE TABLE utxos (
-   tx_id        BIGINT         -- NOT NULL
-  ,txid         BYTEA NOT NULL
-  ,n            INT NOT NULL
-  ,height       INT NOT NULL
-  ,coinbase     BOOL NOT NULL
-  ,value        BIGINT NOT NULL
-  ,scriptpubkey BYTEA NOT NULL
-  );
 `
 	_, err := db.Exec(sqlTables)
 	return err
@@ -847,21 +765,6 @@ func createIndexes1(db *sql.DB, verbose bool) error {
 }
 
 func createIndexes2(db *sql.DB, verbose bool) error {
-	if verbose {
-		log.Printf("  - utxos primary key...")
-	}
-	if _, err := db.Exec(`
-	   DO $$
-	   BEGIN
-	     IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-	                     WHERE table_name = 'utxos' AND constraint_name = 'utxos_pkey') THEN
-            ALTER TABLE utxos ALTER COLUMN tx_id SET NOT NULL;
-	        ALTER TABLE utxos ADD CONSTRAINT utxos_pkey PRIMARY KEY(tx_id, n);
-	     END IF;
-	   END
-	   $$;`); err != nil {
-		return err
-	}
 	if verbose {
 		log.Printf("  - txins (prevout_tx_id, prevout_tx_n) index...")
 	}
@@ -961,21 +864,6 @@ func createConstraints(db *sql.DB, verbose bool) error {
        $$;`); err != nil {
 		return err
 	}
-	if verbose {
-		log.Printf("  - utxos tx_id,n foreign key...")
-	}
-	if _, err := db.Exec(`
-       DO $$
-       BEGIN
-         -- NB: table_name is the target/foreign table
-         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-                         WHERE table_name = 'txouts' AND constraint_name = 'utxos_tx_id_n_fkey') THEN
-           ALTER TABLE utxos ADD CONSTRAINT utxos_tx_id_n_fkey FOREIGN KEY (tx_id, n) REFERENCES txouts(tx_id, n);
-         END IF;
-       END
-       $$;`); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -1044,55 +932,6 @@ func fixPrevoutTxId(db *sql.DB) error {
          END IF;
        END
        $$`); err != nil {
-		return err
-	}
-	return nil
-}
-
-// // This populates spent column so that we can see that an output is
-// // spent. The most efficient way of doing this insanely massive
-// // operation is to create a new table, updating the existing one will
-// // take an eternity.
-// func markSpentOutputs(db *sql.DB) error {
-// 	if _, err := db.Exec(`
-//        DO $$
-//        BEGIN
-//          -- existence of txouts_pkey means it is already done
-//          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-//                          WHERE table_name = 'txouts' AND constraint_name = 'txouts_pkey') THEN
-//            CREATE TABLE txouts_tmp AS
-//              SELECT o.tx_id, o.n, o.value, o.scriptpubkey, i.prevout_tx_id IS NOT NULL AS spent
-//                FROM txouts o
-//                LEFT JOIN txins i
-//                       ON i.prevout_tx_id = o.tx_id AND i.prevout_n = o.n;
-//            DROP TABLE txouts;
-//            ALTER TABLE txouts_tmp RENAME TO txouts;
-//          END IF;
-//        END
-//        $$;`); err != nil {
-// 		return err
-// 	}
-// 	return nil
-// }
-
-// ZZZ unused
-// Link UTXOs to transactions
-func linkUTXOs(db *sql.DB) error {
-	if _, err := db.Exec(`
-       DO $$
-       BEGIN
-         -- existence of txouts_pkey means it is already done
-         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-                         WHERE table_name = 'utxos' AND constraint_name = 'utxos_pkey') THEN
-           CREATE TABLE utxos_tmp AS
-             SELECT t.id AS tx_id, u.txid, u.n, u.height, u.coinbase, u.value, u.scriptpubkey
-               FROM utxos u
-               JOIN txs t ON t.txid = u.txid;
-           DROP TABLE utxos;
-           ALTER TABLE utxos_tmp RENAME TO utxos;
-         END IF;
-       END
-       $$;`); err != nil {
 		return err
 	}
 	return nil
