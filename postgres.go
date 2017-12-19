@@ -53,8 +53,9 @@ type txInRec struct {
 type txOutRec struct {
 	txId  int64
 	n     int
-	hash  Uint256
 	txOut *TxOut
+	hash  Uint256
+	sync  chan bool
 }
 
 type BlockInfo struct {
@@ -84,11 +85,11 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 		return nil, err
 	}
 
-	deferredIndexes := true
+	firstImport := true // firstImport == first import
 	if err := createTables(db); err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			// this is fine, cancel deferred index/constraint creation
-			deferredIndexes = false
+			firstImport = false
 		} else {
 			log.Printf("Tables created without indexes, which are created at the very end.")
 			return nil, err
@@ -97,7 +98,7 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 
 	bch := make(chan *BlockInfo, 64)
 	wg.Add(1)
-	go pgBlockWorker(bch, &wg, db, deferredIndexes, cacheSize, utxo)
+	go pgBlockWorker(bch, &wg, db, firstImport, cacheSize, utxo)
 
 	return &PGWriter{
 		blockCh: bch,
@@ -120,7 +121,7 @@ func (w *PGWriter) LastHeight() (int, error) {
 	return height, err
 }
 
-func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferredIndexes bool, cacheSize int, utxo isUTXOer) {
+func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstImport bool, cacheSize int, utxo isUTXOer) {
 	defer wg.Done()
 
 	bid, _, bhash, err := getLastHashAndHeight(db)
@@ -173,8 +174,8 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 	idCache := newTxIdCache(cacheSize)
 
 	var syncCh chan bool
-	if !deferredIndexes {
-		// no deferredIndexes means that the constraints already
+	if !firstImport {
+		// no firstImport means that the constraints already
 		// exist, and we need to wait for a tx to be commited before
 		// ins/outs can be inserted. Same with block/tx.
 		syncCh = make(chan bool, 0)
@@ -230,11 +231,12 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 					txId:  txid,
 					n:     n,
 					txOut: txout,
+					hash:  hash,
 				}
 			}
 		}
 
-		if !deferredIndexes {
+		if !firstImport {
 			// commit after every block
 			blockCh <- &blockRec{
 				sync: syncCh,
@@ -248,8 +250,14 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 			if syncCh != nil {
 				<-syncCh
 			}
+			// NB: Outputs must be commited before inputs!
+			txOutCh <- &txOutRec{
+				sync: syncCh,
+			}
+			if syncCh != nil {
+				<-syncCh
+			}
 			txInCh <- nil
-			txOutCh <- nil
 		} else if bid%50 == 0 {
 			// commit every N blocks
 			blockCh <- nil
@@ -279,7 +287,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 		idCache.hits, float64(idCache.hits)/(float64(idCache.hits+idCache.miss)+0.0001)*100,
 		idCache.miss, idCache.cols, idCache.dups, idCache.evic)
 
-	verbose := deferredIndexes
+	verbose := firstImport
 	log.Printf("Creating indexes part 1 (if needed), please be patient, this may take a long time...")
 	if err := createIndexes1(db, verbose); err != nil {
 		log.Printf("Error creating indexes: %v", err)
@@ -300,6 +308,12 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 	log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
 	if err := createConstraints(db, verbose); err != nil {
 		log.Printf("Error creating constraints: %v", err)
+	}
+	if firstImport {
+		log.Printf("Creating txins triggers.")
+		if err := createTxinsTriggers(db); err != nil {
+			log.Printf("Error creating txins triggers: %v", err)
+		}
 	}
 	log.Printf("Marking orphan blocks...")
 	if err := setOrphans(db, 0); err != nil {
@@ -345,7 +359,7 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 			if err != nil {
 				log.Printf("ERROR (2): %v", err)
 			}
-			if br != nil && br.block == nil {
+			if br != nil && br.sync != nil {
 				br.sync <- true
 			}
 			continue
@@ -424,7 +438,7 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			if err != nil {
 				log.Printf("ERROR (6): %v", err)
 			}
-			if tr != nil && tr.tx == nil {
+			if tr != nil && tr.sync != nil {
 				tr.sync <- true
 			}
 			continue
@@ -554,7 +568,7 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 
 	for tr := range c {
 
-		if tr == nil { // commit signal
+		if tr == nil || tr.txOut == nil { // commit signal
 			if err = commit(stmt, txn); err != nil {
 				log.Printf("TxOut commit error: %v", err)
 			}
@@ -562,13 +576,20 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 			if err != nil {
 				log.Printf("ERROR (13): %v", err)
 			}
+			if tr != nil && tr.sync != nil {
+				tr.sync <- true
+			}
 			continue
 		}
 
-		spent, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
+		// TODO we probably do not need this when this is not the
+		// first import, as the triggers should maintain the correct
+		// spent status.
+		isUTXO, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
 		if err != nil {
 			log.Printf("ERROR (13.5): %v", err)
 		}
+		spent := !isUTXO
 
 		t := tr.txOut
 		_, err = stmt.Exec(
@@ -928,7 +949,9 @@ UPDATE blocks
 
 // Most of the prevout_tx_id's should be already set during the
 // import, but we need to correct the remaining ones. This is a fairly
-// costly operation as it requires a txins table scan.
+// costly operation as it requires a txins table scan. You can likely
+// avoid it by increasing the txIdCache size. After the first import
+// it will be maintained by triggers.
 func fixPrevoutTxId(db *sql.DB) error {
 	if _, err := db.Exec(`
        DO $$
@@ -946,6 +969,59 @@ func fixPrevoutTxId(db *sql.DB) error {
          END IF;
        END
        $$`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createTxinsTriggers(db *sql.DB) error {
+	if _, err := db.Exec(`
+CREATE OR REPLACE FUNCTION txins_before_trigger_func() RETURNS TRIGGER AS $$
+  BEGIN
+    IF (TG_OP = 'UPDATE' OR TG_OP = 'INSERT') THEN
+      IF NEW.prevout_n <> -1 AND NEW.prevout_tx_id IS NULL THEN
+        SELECT id INTO NEW.prevout_tx_id FROM txs WHERE txid = NEW.prevout_hash;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION 'Unknown prevout_hash %', NEW.prevout_hash;
+        END IF;
+      END IF;
+      RETURN NEW;
+    END IF;
+    RETURN NULL;
+  END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER txins_before_trigger
+BEFORE INSERT OR UPDATE OR DELETE ON txins
+  FOR EACH ROW EXECUTE PROCEDURE txins_before_trigger_func();
+
+CREATE OR REPLACE FUNCTION txins_after_trigger_func() RETURNS TRIGGER AS $$
+  BEGIN
+    IF (TG_OP = 'DELETE') THEN
+      IF OLD.prevout_tx_id IS NOT NULL THEN
+        UPDATE txouts SET spent = FALSE
+         WHERE tx_id = prevout_tx_id AND n = OLD.prevout_n;
+      END IF;
+      RETURN OLD;
+    ELSIF (TG_OP = 'UPDATE' OR TG_OP = 'INSERT') THEN
+      IF NEW.prevout_tx_id IS NOT NULL THEN
+        UPDATE txouts SET spent = TRUE
+         WHERE tx_id = NEW.prevout_tx_id AND n = NEW.prevout_n;
+        IF NOT FOUND THEN
+          RAISE EXCEPTION 'Unknown prevout_n % in txid % (id %)', NEW.prevout_n, NEW.prevout_hash, NEW.prevout_tx_id;
+        END IF;
+      END IF;
+      RETURN NEW;
+    END IF;
+    RETURN NULL;
+  END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER txins_after_trigger
+AFTER INSERT OR UPDATE OR DELETE ON txins DEFERRABLE
+  FOR EACH ROW EXECUTE PROCEDURE txins_after_trigger_func();
+
+        `); err != nil {
 		return err
 	}
 	return nil
