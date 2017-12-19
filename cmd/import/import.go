@@ -53,6 +53,10 @@ func processEverything(dbconnect, blocksPath, indexPath, chainStatePath string, 
 
 	log.Printf("Reading block headers from LevelDb (%s)...", indexPath)
 	bhs, err := blkchain.ReadBlockHeaderIndex(indexPath, blocksPath)
+	if err != nil {
+		log.Fatalf("ERROR: %v", err)
+		return
+	}
 	log.Printf("Read %d block headers.", bhs.Count())
 	if bhs.Count() == 0 {
 		log.Printf("Is Core running? Stop it first, and try again. Exiting.")
@@ -97,10 +101,10 @@ func processBlocks(writer *blkchain.PGWriter, bhs *blkchain.BlockHeaderIndex, bl
 	}
 	if lastHeight > 0 {
 		// lastHeight is correct, pgwriter will ignore the last block
-		// starting with lastHeight+1 risks skipping duplicates in
-		// case of a split
-		log.Printf("Starting with block height: %d", lastHeight)
-		bhs.Start(lastHeight)
+		// starting with lastHeight (as opposed to lH-1) risks
+		// skipping duplicates in case of a split
+		log.Printf("Starting with block height: %d", lastHeight-1)
+		bhs.Start(lastHeight - 1)
 	}
 
 	for bhs.Next() {

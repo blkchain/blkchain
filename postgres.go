@@ -151,7 +151,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 	start := time.Now()
 
 	if len(bhash) > 0 {
-		log.Printf("Skipping to hash %v", uint256FromBytes(bhash))
+		log.Printf("PGWriter ignoring blocks up toa hash %v", uint256FromBytes(bhash))
 		skip, last := 0, time.Now()
 		for b := range ch {
 			hash := b.Hash()
@@ -160,12 +160,14 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 			} else {
 				skip++
 				if skip%10 == 0 && time.Now().Sub(last) > 5*time.Second {
-					log.Printf("Skipped %d blocks...", skip)
+					log.Printf(" - ignored %d blocks...", skip)
 					last = time.Now()
 				}
 			}
 		}
-		log.Printf("Skipped %d total blocks.", skip)
+		if skip > 0 {
+			log.Printf("Ignored %d total blocks.", skip)
+		}
 	}
 
 	idCache := newTxIdCache(cacheSize)
@@ -190,10 +192,6 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 			status:  bi.Status,
 			filen:   bi.FileN,
 			filepos: bi.FilePos,
-			sync:    syncCh,
-		}
-		if syncCh != nil {
-			<-syncCh
 		}
 
 		for n, tx := range bi.Txs {
@@ -210,12 +208,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 				blockId: bid,
 				tx:      tx,
 				hash:    hash,
-				sync:    syncCh,
 				dupe:    recentId != txid,
-			}
-
-			if syncCh != nil {
-				<-syncCh
 			}
 
 			if recentId != txid {
@@ -243,7 +236,18 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, deferre
 
 		if !deferredIndexes {
 			// commit after every block
-			// blocks and txs are already commited
+			blockCh <- &blockRec{
+				sync: syncCh,
+			}
+			if syncCh != nil {
+				<-syncCh
+			}
+			txCh <- &txRec{
+				sync: syncCh,
+			}
+			if syncCh != nil {
+				<-syncCh
+			}
 			txInCh <- nil
 			txOutCh <- nil
 		} else if bid%50 == 0 {
@@ -310,6 +314,10 @@ func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) 
 		return nil, nil, err
 	}
 
+	if _, err := txn.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
+		return nil, nil, err
+	}
+
 	stmt, err := txn.Prepare(pq.CopyIn(table, cols...))
 	if err != nil {
 		return nil, nil, err
@@ -329,13 +337,16 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 
 	for br := range c {
 
-		if br == nil { // commit signal
+		if br == nil || br.block == nil { // commit signal
 			if err = commit(stmt, txn); err != nil {
 				log.Printf("Block commit error: %v", err)
 			}
 			txn, stmt, err = begin(db, "blocks", cols)
 			if err != nil {
 				log.Printf("ERROR (2): %v", err)
+			}
+			if br != nil && br.block == nil {
+				br.sync <- true
 			}
 			continue
 		}
@@ -398,7 +409,7 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 	}
 
 	for tr := range c {
-		if tr == nil { // commit signal
+		if tr == nil || tr.tx == nil { // commit signal
 			if err = commit(stmt, txn); err != nil {
 				log.Printf("Tx commit error: %v", err)
 			}
@@ -412,6 +423,9 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			btxn, bstmt, err = begin(db, "block_txs", bcols)
 			if err != nil {
 				log.Printf("ERROR (6): %v", err)
+			}
+			if tr != nil && tr.tx == nil {
+				tr.sync <- true
 			}
 			continue
 		}
