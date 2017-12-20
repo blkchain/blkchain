@@ -22,7 +22,7 @@ generally applicable to any Bitcoin copycat out there as well.
 
 ## Quick Overview
 
-The source of the data is the Bitcoin Core store. You need a Core
+The source of the data is the [Bitcoin Core](https://bitcoin.org/en/download) store. You need a Core
 instance to download the entire blockchain, then the `cmd/import` tool
 will be able to read the data *directly* (not via RPC) by accessing
 the LevelDb and the blocks files as well as the UTXO set. (The Core
