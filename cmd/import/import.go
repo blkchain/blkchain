@@ -19,7 +19,7 @@ func main() {
 	indexPath := flag.String("index", "", "/path/to/blocks/index (levelDb)")
 	chainStatePath := flag.String("chainstate", "", "/path/to/blocks/chainstate (levelDb UTXO set)")
 	testNet := flag.Bool("testnet", false, "Use testnet magic")
-	cacheSize := flag.Int("cache-size", 1024*1024*10, "Tx hashes to cache for pervout_tx_id")
+	cacheSize := flag.Int("cache-size", 1024*1024*30, "Tx hashes to cache for pervout_tx_id")
 
 	flag.Parse()
 
