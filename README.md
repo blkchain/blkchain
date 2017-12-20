@@ -47,7 +47,7 @@ set so that we can set the `spent` column correctly.
 
 The output should look approximately like this:
 
-``` sh
+``` txt
 2017/12/19 18:24:42 Setting open files rlimit of 256 to 1024.
 2017/12/19 18:24:42 Reading block headers from LevelDb (/Volumes/SSD/Private/Bitcoin/blocks/index)...
 2017/12/19 18:24:46 Ignoring orphan block 00000000000000000b5f97a18352ec38f9b5b20603c8fcd8f25ec9ee1ae0cf93
@@ -62,8 +62,7 @@ The output should look approximately like this:
 2017/12/19 18:25:03 Height: 86063 Txs: 130220 Time: 2010-10-18 12:37:57 -0400 EDT Tx/s: 8675.402340
 2017/12/19 18:25:08 Height: 97697 Txs: 208377 Time: 2010-12-15 10:19:17 -0500 EST Tx/s: 10413.251706
 
-   ... snip ...
-
+  ... snip ...
 
 2017/12/20 04:07:02 Height: 499853 Txs: 283295062 Time: 2017-12-17 17:10:19 -0500 EST Tx/s: 8108.974619
 2017/12/20 04:07:06 Closed db channels, waiting for workers to finish...
