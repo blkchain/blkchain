@@ -13,7 +13,9 @@ therefore it is likely that this project will be reorganized into more
 separate packages.
 
 The goal here is to facilitate blockchain development using Go and
-PostgreSQL. If this sounds interesting, please help out by trying this
+PostgreSQL. There is also a sister project [pg_blockchain](https://github.com/blkchain/pg_blkchain)
+which is a Postgres C language extension aimed at doing blockchain stuff inside the server.
+If this sounds interesting, please help us out by trying this
 out, we would very much appreciate any feedback, be it criticism, bug
 fixes or ideas.
 
