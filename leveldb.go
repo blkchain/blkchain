@@ -130,7 +130,7 @@ func NewChainStateChecker(path string) (*ChainStateReader, error) {
 
 func (r *ChainStateReader) IsUTXO(hash Uint256, n uint32) (bool, error) {
 	var buf [40]byte
-	w := bytes.NewBuffer(buf[:])
+	w := bytes.NewBuffer(buf[:0])
 	w.WriteByte('C')
 	if err := BinWrite(&DbOutPoint{hash, n}, w); err != nil {
 		return false, err

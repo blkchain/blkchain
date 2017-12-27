@@ -747,7 +747,7 @@ func createIndexes1(db *sql.DB, verbose bool) error {
 	if verbose {
 		log.Printf("  - blocks hash index...")
 	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS blocks_hash_idx ON blocks(hash);"); err != nil {
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS blocks_hash_idx ON blocks(hash);"); err != nil {
 		return err
 	}
 	if verbose {
