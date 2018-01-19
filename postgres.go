@@ -135,7 +135,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 		return
 	}
 
-	blockCh := make(chan *blockRec, 64)
+	blockCh := make(chan *blockRec, 2)
 	go pgBlockWriter(blockCh, db)
 
 	txCh := make(chan *txRec, 64)
@@ -152,7 +152,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 	start := time.Now()
 
 	if len(bhash) > 0 {
-		log.Printf("PGWriter ignoring blocks up toa hash %v", uint256FromBytes(bhash))
+		log.Printf("PGWriter ignoring blocks up to hash %v", uint256FromBytes(bhash))
 		skip, last := 0, time.Now()
 		for b := range ch {
 			hash := b.Hash()
