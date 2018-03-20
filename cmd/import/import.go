@@ -109,6 +109,9 @@ func processBlocks(writer *blkchain.PGWriter, bhs *blkchain.BlockHeaderIndex, bl
 
 	for bhs.Next() {
 		bh := bhs.BlockHeader()
+		if bh == nil {
+			return fmt.Errorf("Nil block header at %d.", bhs.Height())
+		}
 		b, err := bh.ReadBlock(blocksPath, magic)
 		if err != nil {
 			log.Printf("Error: %v", err)

@@ -22,19 +22,23 @@ func (bi *BlockHeaderIndex) Next() bool {
 	if len(bi.m) == 0 { // just in case
 		return false
 	}
+	if bi.height > bi.maxHeight {
+		return false
+	}
 	if bi.n < len(bi.m[bi.height])-1 {
 		bi.n++
-	} else if bi.height < bi.maxHeight {
+	} else {
 		bi.height++
 		bi.n = 0
-	} else {
-		return false
 	}
 	return true
 }
 
 func (bi *BlockHeaderIndex) BlockHeader() *IdxBlockHeader {
-	return bi.m[bi.height][bi.n]
+	if len(bi.m[bi.height]) > 0 {
+		return bi.m[bi.height][bi.n]
+	}
+	return nil
 }
 
 func (bi *BlockHeaderIndex) Start(height int) {
@@ -43,6 +47,10 @@ func (bi *BlockHeaderIndex) Start(height int) {
 
 func (bi *BlockHeaderIndex) Count() int {
 	return bi.count
+}
+
+func (bi *BlockHeaderIndex) Height() int {
+	return bi.height
 }
 
 // Returns a BlockHeaderIndex over which we can iterate with
@@ -88,6 +96,8 @@ func ReadBlockHeaderIndex(path, blocksPath string) (*BlockHeaderIndex, error) {
 		result.count++
 	}
 
+	log.Printf("Read %d block header entries, maxHeight: %d.", result.count, result.maxHeight)
+
 	// Eliminate orphans by walking the chan backwards and whenever we
 	// see more than one block at a height, picking the one that
 	// matches its descendant's PrevHash.
@@ -109,7 +119,15 @@ func ReadBlockHeaderIndex(path, blocksPath string) (*BlockHeaderIndex, error) {
 				return nil, fmt.Errorf("Problem finding valid parent when eliminating orphans.")
 			}
 		}
-		prevHash = result.m[h][0].PrevHash
+		if len(result.m[h]) > 0 {
+			prevHash = result.m[h][0].PrevHash
+		} else {
+			// It's possible we're missing a block. In which case reduce maxHeight by -2 (yes)
+			if h < result.maxHeight {
+				log.Printf("No block header at height %d, reducing maxHeight to: %d", h, h-2)
+				result.maxHeight = h - 2
+			}
+		}
 	}
 
 	return result, nil
