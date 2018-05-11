@@ -3,7 +3,7 @@ package blkchain
 import (
 	"io"
 
-	"github.com/btcd/btcec"
+	"github.com/btcsuite/btcd/btcec"
 )
 
 type UTXO struct {
