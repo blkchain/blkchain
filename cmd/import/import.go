@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/yaslama/blkchain"
+	"github.com/blkchain/blkchain"
 )
 
 func main() {
