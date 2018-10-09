@@ -91,12 +91,15 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 			// this is fine, cancel deferred index/constraint creation
 			firstImport = false
 		} else {
+			if utxo == nil {
+				return nil, fmt.Errorf("First import must be done with UTXO checker, i.e. from LevelDb directly. (utxo == nil)")
+			}
 			log.Printf("Tables created without indexes, which are created at the very end.")
 			return nil, err
 		}
 	}
 
-	bch := make(chan *BlockInfo, 64)
+	bch := make(chan *BlockInfo, 8)
 	wg.Add(1)
 	go pgBlockWorker(bch, &wg, db, firstImport, cacheSize, utxo)
 
@@ -116,9 +119,9 @@ func (p *PGWriter) WriteBlockInfo(b *BlockInfo) {
 	p.blockCh <- b
 }
 
-func (w *PGWriter) LastHeight() (int, error) {
-	_, height, _, err := getLastHashAndHeight(w.db)
-	return height, err
+func (w *PGWriter) LastHeightHash() (int, Uint256, error) {
+	_, height, hash, err := getLastHashAndHeight(w.db)
+	return height, uint256FromBytes(hash), err
 }
 
 func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstImport bool, cacheSize int, utxo isUTXOer) {
@@ -151,7 +154,8 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 
 	start := time.Now()
 
-	if len(bhash) > 0 {
+	// nil utxo means this is coming from a btcnode, we do not need to skip blocks
+	if utxo != nil && len(bhash) > 0 {
 		log.Printf("PGWriter ignoring blocks up to hash %v", uint256FromBytes(bhash))
 		skip, last := 0, time.Now()
 		for b := range ch {
@@ -185,6 +189,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 	for bi := range ch {
 		bid++
 		hash := bi.Hash()
+
 		blockCh <- &blockRec{
 			id:      bid,
 			height:  bi.Height,
@@ -582,14 +587,17 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 			continue
 		}
 
-		// TODO we probably do not need this when this is not the
-		// first import, as the triggers should maintain the correct
-		// spent status.
-		isUTXO, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
-		if err != nil {
-			log.Printf("ERROR (13.5): %v", err)
+		var spent bool
+		if utxo != nil {
+			// TODO we probably do not need this when this is not the
+			// first import, as the triggers should maintain the correct
+			// spent status.
+			isUTXO, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
+			if err != nil {
+				log.Printf("ERROR (13.5): %v", err)
+			}
+			spent = !isUTXO
 		}
-		spent := !isUTXO
 
 		t := tr.txOut
 		_, err = stmt.Exec(

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
@@ -11,14 +13,15 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
-type BlockHeaderIndex struct {
+type levelDbBlockHeaderIndex struct {
 	m                    map[int][]*IdxBlockHeader
 	blocksPath           string
+	magic                uint32
 	height, maxHeight, n int
 	count                int
 }
 
-func (bi *BlockHeaderIndex) Next() bool {
+func (bi *levelDbBlockHeaderIndex) Next() bool {
 	if len(bi.m) == 0 { // just in case
 		return false
 	}
@@ -34,32 +37,52 @@ func (bi *BlockHeaderIndex) Next() bool {
 	return true
 }
 
-func (bi *BlockHeaderIndex) BlockHeader() *IdxBlockHeader {
+func (bi *levelDbBlockHeaderIndex) BlockHeader() *IdxBlockHeader {
 	if len(bi.m[bi.height]) > 0 {
 		return bi.m[bi.height][bi.n]
 	}
 	return nil
 }
 
-func (bi *BlockHeaderIndex) Start(height int) {
-	bi.height = height
-}
-
-func (bi *BlockHeaderIndex) Count() int {
+func (bi *levelDbBlockHeaderIndex) Count() int {
 	return bi.count
 }
 
-func (bi *BlockHeaderIndex) Height() int {
+func (bi *levelDbBlockHeaderIndex) CurrentHeight() int {
 	return bi.height
 }
 
-// Returns a BlockHeaderIndex over which we can iterate with
+func (bi *levelDbBlockHeaderIndex) ReadBlock() (*Block, error) {
+
+	ibh := bi.BlockHeader()
+
+	path := filepath.Join(bi.blocksPath, fmt.Sprintf("%s%05d.dat", "blk", int(ibh.FileN)))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("Opening file %v: %v", path, err)
+	}
+	defer f.Close()
+
+	pos := int64(ibh.DataPos) - 8 // magic + size = 8
+	if _, err := f.Seek(pos, 0); err != nil {
+		return nil, fmt.Errorf("Seeking to pos %d in file %v: %v", pos, path, err)
+	}
+
+	b := Block{Magic: bi.magic}
+	if err := BinRead(&b, f); err != nil {
+		return nil, fmt.Errorf("Reading block: %v", err)
+	}
+
+	return &b, nil
+}
+
+// Returns a levelDbBlockHeaderIndex over which we can iterate with
 // Next(). Some heights have multiple blocks. This func removes
 // orphans (TODO - why do we, it caused a problem with marking spends,
 // but that should be no longer an issue since we import UTXO set
 // separately?) Core cannot be running during this (TODO why?), but as
 // soon as it is done you should be able to start it back up.
-func ReadBlockHeaderIndex(path, blocksPath string) (*BlockHeaderIndex, error) {
+func ReadLevelDbBlockHeaderIndex(path, blocksPath string, magic uint32, startHeight int) (BlockHeaderIndex, error) {
 
 	db, err := leveldb.OpenFile(path, &opt.Options{ReadOnly: true})
 	if err != nil {
@@ -67,9 +90,11 @@ func ReadBlockHeaderIndex(path, blocksPath string) (*BlockHeaderIndex, error) {
 	}
 	defer db.Close()
 
-	result := &BlockHeaderIndex{
+	result := &levelDbBlockHeaderIndex{
 		m:          make(map[int][]*IdxBlockHeader, 500000),
+		height:     startHeight,
 		blocksPath: blocksPath,
+		magic:      magic,
 	}
 
 	iter := db.NewIterator(util.BytesPrefix([]byte("b")), nil)
@@ -98,37 +123,12 @@ func ReadBlockHeaderIndex(path, blocksPath string) (*BlockHeaderIndex, error) {
 
 	log.Printf("Read %d block header entries, maxHeight: %d.", result.count, result.maxHeight)
 
-	// Eliminate orphans by walking the chan backwards and whenever we
-	// see more than one block at a height, picking the one that
-	// matches its descendant's PrevHash.
-	if len(result.m[result.maxHeight]) > 1 {
-		return nil, fmt.Errorf("Chain is presently at a split, cannot continue.")
+	// Eliminate orphans
+	mh, c, err := EliminateOrphans(result.m, result.maxHeight, result.count)
+	if err != nil {
+		return nil, err
 	}
-	prevHash := result.m[result.maxHeight][0].PrevHash
-	for h := result.maxHeight - 1; h > 0; h-- {
-		if len(result.m[h]) > 1 {
-			for _, bh := range result.m[h] {
-				if bh.Hash() == prevHash {
-					result.m[h] = []*IdxBlockHeader{bh}
-				} else {
-					log.Printf("Ignoring orphan block %v", bh.Hash())
-					result.count--
-				}
-			}
-			if len(result.m[h]) != 1 {
-				return nil, fmt.Errorf("Problem finding valid parent when eliminating orphans.")
-			}
-		}
-		if len(result.m[h]) > 0 {
-			prevHash = result.m[h][0].PrevHash
-		} else {
-			// It's possible we're missing a block. In which case reduce maxHeight by -2 (yes)
-			if h < result.maxHeight {
-				log.Printf("No block header at height %d, reducing maxHeight to: %d", h, h-2)
-				result.maxHeight = h - 2
-			}
-		}
-	}
+	result.maxHeight, result.count = mh, c
 
 	return result, nil
 }

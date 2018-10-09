@@ -45,7 +45,7 @@ func (u *UTXO) BinRead(r io.Reader) (err error) {
 	// https://github.com/bitcoin/bitcoin/blob/0.15/src/coins.h#L67
 
 	// Height and CoinBase
-	var code varInt32
+	var code VarInt32
 	if err := BinRead(&code, r); err != nil {
 		return err
 	}
@@ -61,7 +61,7 @@ func (u *UTXO) BinRead(r io.Reader) (err error) {
 	}
 
 	// Size
-	var vs varInt32
+	var vs VarInt32
 	if err := BinRead(&vs, r); err != nil {
 		return err
 	}
@@ -114,7 +114,7 @@ func decompressAmount(x uint64) uint64 {
 }
 
 // https://github.com/bitcoin/bitcoin/blob/0.15/src/compressor.cpp#L79
-func getSpecialSize(size varInt32) int {
+func getSpecialSize(size VarInt32) int {
 	if size == 0 || size == 1 {
 		return 20
 	}

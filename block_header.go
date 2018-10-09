@@ -4,8 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
+	"log"
 )
 
 type BlockHeader struct {
@@ -23,26 +22,34 @@ func (bh *BlockHeader) Hash() Uint256 {
 	return ShaSha256(buf.Bytes())
 }
 
-type varInt32 uint32
+type BlockHeaderIndex interface {
+	Next() bool
+	BlockHeader() *IdxBlockHeader
+	ReadBlock() (*Block, error)
+	Count() int
+	CurrentHeight() int
+}
 
-func (v *varInt32) BinRead(r io.Reader) error {
+type VarInt32 uint32
+
+func (v *VarInt32) BinRead(r io.Reader) error {
 	if i, err := readVarInt(r); err != nil {
 		return err
 	} else {
-		*v = varInt32(i)
+		*v = VarInt32(i)
 		return nil
 	}
 }
 
 // Block information stored in LevelDb.
 type IdxBlockHeader struct {
-	Version varInt32 // Qt/Core software version
-	Height  varInt32
-	Status  varInt32
-	TxN     varInt32
-	FileN   varInt32
-	DataPos varInt32
-	UndoPos varInt32
+	Version VarInt32 // Qt/Core software version
+	Height  VarInt32
+	Status  VarInt32
+	TxN     VarInt32
+	FileN   VarInt32
+	DataPos VarInt32
+	UndoPos VarInt32
 	BlockHeader
 }
 
@@ -97,24 +104,45 @@ func (ibh *IdxBlockHeader) BinRead(r io.Reader) (err error) {
 	return nil
 }
 
-func (ibh *IdxBlockHeader) ReadBlock(blocksPath string, magic uint32) (*Block, error) {
-
-	path := filepath.Join(blocksPath, fmt.Sprintf("%s%05d.dat", "blk", int(ibh.FileN)))
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("Opening file %v: %v", path, err)
-	}
-	defer f.Close()
-
-	pos := int64(ibh.DataPos) - 8 // magic + size = 8
-	if _, err := f.Seek(pos, 0); err != nil {
-		return nil, fmt.Errorf("Seeking to pos %d in file %v: %v", pos, path, err)
+// Eliminate orphans by walking the chan backwards and whenever we
+// see more than one block at a height, picking the one that
+// matches its descendant's PrevHash.
+func EliminateOrphans(m map[int][]*IdxBlockHeader, maxHeight, count int) (_maxHeight, _count int, err error) {
+	// Find minHeight
+	minHeight := maxHeight
+	for k, _ := range m {
+		if minHeight > k {
+			minHeight = k
+		}
 	}
 
-	b := Block{Magic: magic}
-	if err := BinRead(&b, f); err != nil {
-		return nil, fmt.Errorf("Reading block: %v", err)
+	if len(m[maxHeight]) > 1 {
+		return 0, 0, fmt.Errorf("Chain is presently at a split, cannot continue.")
 	}
-
-	return &b, nil
+	prevHash := m[maxHeight][0].PrevHash
+	for h := maxHeight - 1; h > minHeight; h-- {
+		if len(m[h]) > 1 {
+			for _, bh := range m[h] {
+				if bh.Hash() == prevHash {
+					m[h] = []*IdxBlockHeader{bh}
+				} else {
+					log.Printf("Ignoring orphan block %v", bh.Hash())
+					count--
+				}
+			}
+			if len(m[h]) != 1 {
+				return 0, 0, fmt.Errorf("Problem finding valid parent when eliminating orphans.")
+			}
+		}
+		if len(m[h]) > 0 {
+			prevHash = m[h][0].PrevHash
+		} else {
+			// It's possible we're missing a block. In which case reduce maxHeight by -2 (yes)
+			if h < maxHeight {
+				log.Printf("No block header at height %d, reducing maxHeight to: %d", h, h-2)
+				maxHeight = h - 2
+			}
+		}
+	}
+	return maxHeight, count, nil
 }
