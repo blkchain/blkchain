@@ -1,4 +1,4 @@
-package blkchain
+package db
 
 import (
 	"bytes"
@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blkchain/blkchain"
 	"github.com/lib/pq"
 )
 
@@ -22,23 +23,20 @@ import (
 var writerWg sync.WaitGroup
 
 type blockRec struct {
-	id      int
-	height  int
-	block   *Block
-	hash    Uint256
-	orphan  bool
-	status  int
-	filen   int
-	filepos int
-	sync    chan bool
+	id     int
+	height int
+	block  *blkchain.Block
+	hash   blkchain.Uint256
+	orphan bool
+	sync   chan bool
 }
 
 type txRec struct {
 	id      int64
 	blockId int
 	n       int // position within block
-	tx      *Tx
-	hash    Uint256
+	tx      *blkchain.Tx
+	hash    blkchain.Uint256
 	sync    chan bool
 	dupe    bool // already seen
 }
@@ -46,24 +44,21 @@ type txRec struct {
 type txInRec struct {
 	txId    int64
 	n       int
-	txIn    *TxIn
+	txIn    *blkchain.TxIn
 	idCache *txIdCache
 }
 
 type txOutRec struct {
 	txId  int64
 	n     int
-	txOut *TxOut
-	hash  Uint256
+	txOut *blkchain.TxOut
+	hash  blkchain.Uint256
 	sync  chan bool
 }
 
 type BlockInfo struct {
-	*Block
-	Height,
-	Status,
-	FileN,
-	FilePos int
+	*blkchain.Block
+	Height int
 }
 
 type PGWriter struct {
@@ -73,7 +68,7 @@ type PGWriter struct {
 }
 
 type isUTXOer interface {
-	IsUTXO(Uint256, uint32) (bool, error)
+	IsUTXO(blkchain.Uint256, uint32) (bool, error)
 }
 
 func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error) {
@@ -119,9 +114,9 @@ func (p *PGWriter) WriteBlockInfo(b *BlockInfo) {
 	p.blockCh <- b
 }
 
-func (w *PGWriter) LastHeightHash() (int, Uint256, error) {
+func (w *PGWriter) LastHeightHash() (int, blkchain.Uint256, error) {
 	_, height, hash, err := getLastHashAndHeight(w.db)
-	return height, uint256FromBytes(hash), err
+	return height, blkchain.Uint256FromBytes(hash), err
 }
 
 func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstImport bool, cacheSize int, utxo isUTXOer) {
@@ -156,7 +151,7 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 
 	// nil utxo means this is coming from a btcnode, we do not need to skip blocks
 	if utxo != nil && len(bhash) > 0 {
-		log.Printf("PGWriter ignoring blocks up to hash %v", uint256FromBytes(bhash))
+		log.Printf("PGWriter ignoring blocks up to hash %v", blkchain.Uint256FromBytes(bhash))
 		skip, last := 0, time.Now()
 		for b := range ch {
 			hash := b.Hash()
@@ -191,13 +186,10 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 		hash := bi.Hash()
 
 		blockCh <- &blockRec{
-			id:      bid,
-			height:  bi.Height,
-			block:   bi.Block,
-			hash:    hash,
-			status:  bi.Status,
-			filen:   bi.FileN,
-			filepos: bi.FilePos,
+			id:     bid,
+			height: bi.Height,
+			block:  bi.Block,
+			hash:   hash,
 		}
 
 		for n, tx := range bi.Txs {
@@ -347,7 +339,7 @@ func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) 
 func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan", "status", "filen", "filepos"}
+	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan"}
 
 	txn, stmt, err := begin(db, "blocks", cols)
 	if err != nil {
@@ -382,9 +374,6 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 			int32(b.Bits),
 			int32(b.Nonce),
 			br.orphan,
-			int32(br.status),
-			int32(br.filen),
-			int32(br.filepos),
 		)
 		if err != nil {
 			log.Printf("ERROR (3): %v", err)
@@ -530,7 +519,7 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 		var wb interface{}
 		if t.Witness != nil {
 			var b bytes.Buffer
-			BinWrite(&t.Witness, &b)
+			blkchain.BinWrite(&t.Witness, &b)
 			wb = b.Bytes()
 		}
 
@@ -689,9 +678,6 @@ func createTables(db *sql.DB) error {
   ,bits         INT NOT NULL
   ,nonce        INT NOT NULL
   ,orphan       BOOLEAN NOT NULL DEFAULT false
-  ,status       INT NOT NULL
-  ,filen        INT NOT NULL
-  ,filepos      INT NOT NULL
   );
 
   CREATE TABLE txs (

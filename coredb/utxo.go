@@ -1,8 +1,9 @@
-package blkchain
+package coredb
 
 import (
 	"io"
 
+	"github.com/blkchain/blkchain"
 	"github.com/btcsuite/btcd/btcec"
 )
 
@@ -10,18 +11,18 @@ type UTXO struct {
 	DbOutPoint
 	Height   int
 	Coinbase bool
-	TxOut
+	blkchain.TxOut
 }
 
 // An OutPoint which uses a varint for N such as the case in
 // chainstate LevelDb keys
-type DbOutPoint OutPoint
+type DbOutPoint blkchain.OutPoint
 
 func (o *DbOutPoint) BinRead(r io.Reader) error {
-	if err := BinRead(&o.Hash, r); err != nil {
+	if err := blkchain.BinRead(&o.Hash, r); err != nil {
 		return err
 	}
-	if n, err := readVarInt(r); err != nil {
+	if n, err := blkchain.ReadVarInt(r); err != nil {
 		return err
 	} else {
 		o.N = uint32(n)
@@ -30,10 +31,10 @@ func (o *DbOutPoint) BinRead(r io.Reader) error {
 }
 
 func (o *DbOutPoint) BinWrite(w io.Writer) error {
-	if err := BinWrite(o.Hash, w); err != nil {
+	if err := blkchain.BinWrite(o.Hash, w); err != nil {
 		return err
 	}
-	if err := writeVarInt(uint64(o.N), w); err != nil {
+	if err := blkchain.WriteVarInt(uint64(o.N), w); err != nil {
 		return err
 	}
 	return nil
@@ -46,7 +47,7 @@ func (u *UTXO) BinRead(r io.Reader) (err error) {
 
 	// Height and CoinBase
 	var code VarInt32
-	if err := BinRead(&code, r); err != nil {
+	if err := blkchain.BinRead(&code, r); err != nil {
 		return err
 	}
 	u.Height = int(code >> 1)
@@ -54,7 +55,7 @@ func (u *UTXO) BinRead(r io.Reader) (err error) {
 
 	// Value: a riddle wrapped in an enigma. This a compressed integer
 	// stored as a varint, very interesting.
-	if vv, err := readVarInt(r); err != nil {
+	if vv, err := blkchain.ReadVarInt(r); err != nil {
 		return err
 	} else {
 		u.Value = int64(decompressAmount(vv))
@@ -62,7 +63,7 @@ func (u *UTXO) BinRead(r io.Reader) (err error) {
 
 	// Size
 	var vs VarInt32
-	if err := BinRead(&vs, r); err != nil {
+	if err := blkchain.BinRead(&vs, r); err != nil {
 		return err
 	}
 

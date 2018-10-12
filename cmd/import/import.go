@@ -12,6 +12,8 @@ import (
 
 	"github.com/blkchain/blkchain"
 	"github.com/blkchain/blkchain/btcnode"
+	"github.com/blkchain/blkchain/coredb"
+	"github.com/blkchain/blkchain/db"
 )
 
 func main() {
@@ -67,7 +69,7 @@ func main() {
 
 func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cacheSize int) {
 
-	writer, err := blkchain.NewPGWriter(dbconnect, cacheSize, nil)
+	writer, err := db.NewPGWriter(dbconnect, cacheSize, nil)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
@@ -111,13 +113,13 @@ func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cache
 
 func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int) {
 
-	utxo, err := blkchain.NewChainStateChecker(chainStatePath)
+	utxo, err := coredb.NewChainStateChecker(chainStatePath)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
 	defer utxo.Close()
 
-	writer, err := blkchain.NewPGWriter(dbconnect, cacheSize, utxo)
+	writer, err := db.NewPGWriter(dbconnect, cacheSize, utxo)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
@@ -137,7 +139,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 	}
 
 	log.Printf("Reading block headers from LevelDb (%s)...", indexPath)
-	bhs, err := blkchain.ReadLevelDbBlockHeaderIndex(indexPath, blocksPath, magic, startHeight)
+	bhs, err := coredb.ReadLevelDbBlockHeaderIndex(indexPath, blocksPath, magic, startHeight)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 		return
@@ -168,7 +170,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 	log.Printf("All done.")
 }
 
-func processBlocks(writer *blkchain.PGWriter, bhs blkchain.BlockHeaderIndex, interrupt chan bool) error {
+func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, interrupt chan bool) error {
 	for bhs.Next() {
 		bh := bhs.BlockHeader()
 
@@ -182,15 +184,9 @@ func processBlocks(writer *blkchain.PGWriter, bhs blkchain.BlockHeaderIndex, int
 			break
 		}
 
-		bi := &blkchain.BlockInfo{
-			Block:   b,
-			Height:  int(bh.Height),
-			Status:  int(bh.Status),
-			FileN:   int(bh.FileN),
-			FilePos: int(bh.DataPos),
-		}
-		if bi.FileN == 0 && bi.FilePos == 0 {
-			bi.FileN, bi.FilePos = -1, -1 // this came from btcnode
+		bi := &db.BlockInfo{
+			Block:  b,
+			Height: int(bhs.CurrentHeight()),
 		}
 
 		writer.WriteBlockInfo(bi)

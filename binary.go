@@ -149,7 +149,7 @@ func writeList(w io.Writer, size int, doWrite func(io.Writer, int) error) error 
 // https://github.com/bitcoin/bitcoin/blob/0.15/src/serialize.h#L334
 // The origin of this encoding is not clear to me, it is similar to LEB128.
 // More info here: https://bitcoin.stackexchange.com/questions/51620/cvarint-serialization-format/51623
-func readVarInt(r io.Reader) (uint64, error) {
+func ReadVarInt(r io.Reader) (uint64, error) {
 	var n uint64
 	for {
 		var buf [1]byte
@@ -172,7 +172,7 @@ func readVarInt(r io.Reader) (uint64, error) {
 }
 
 // https://github.com/bitcoin/bitcoin/blob/0.15/src/serialize.h#L317
-func writeVarInt(n uint64, w io.Writer) (err error) {
+func WriteVarInt(n uint64, w io.Writer) (err error) {
 	buf := make([]byte, 10)
 	len := 0
 	for {

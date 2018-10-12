@@ -2,6 +2,7 @@ package blkchain
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 )
 
@@ -16,6 +17,11 @@ func (u Uint256) String() (s string) {
 	return
 }
 
+// TODO This may be wrong, do we want this here?
+func (u Uint256) MarshalJSON() ([]byte, error) {
+	return json.Marshal(u.String())
+}
+
 // NB: we interpret this as little-endian. Traditionally Bitcoin
 // transaction ids are printed in big-endian, i.e. reverse of this.
 func ShaSha256(b []byte) Uint256 {
@@ -23,7 +29,7 @@ func ShaSha256(b []byte) Uint256 {
 	return sha256.Sum256(first[:])
 }
 
-func uint256FromBytes(from []byte) Uint256 {
+func Uint256FromBytes(from []byte) Uint256 {
 	var result Uint256
 	copy(result[:], from)
 	return result

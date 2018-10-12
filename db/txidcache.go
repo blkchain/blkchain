@@ -1,8 +1,10 @@
-package blkchain
+package db
 
 import (
 	"log"
 	"sync"
+
+	"github.com/blkchain/blkchain"
 )
 
 // We are avoiding defer Unlock() because rumors are it is slower than
@@ -100,7 +102,7 @@ func (c *txIdCache) checkSize() {
 	}
 }
 
-func (c *txIdCache) add(hash Uint256, id int64, cnt int) int64 {
+func (c *txIdCache) add(hash blkchain.Uint256, id int64, cnt int) int64 {
 	var (
 		key    [HASH_PREFIX_SIZE]byte
 		result int64
@@ -131,7 +133,7 @@ func (c *txIdCache) add(hash Uint256, id int64, cnt int) int64 {
 }
 
 // Note that check is destructive, see comment at the top.
-func (c *txIdCache) check(hash Uint256) *int64 {
+func (c *txIdCache) check(hash blkchain.Uint256) *int64 {
 	var key [HASH_PREFIX_SIZE]byte
 	copy(key[:], hash[:HASH_PREFIX_SIZE])
 
