@@ -172,8 +172,8 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 			<-bi.Sync
 
 			go func() {
-				log.Printf("Marking orphan blocks going back 10...")
-				writer.SetOrphans(10)
+				log.Printf("Marking orphan blocks...")
+				writer.SetOrphans()
 				log.Printf("Marking orphan blocks done.")
 			}()
 		}

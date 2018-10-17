@@ -368,15 +368,8 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 		}
 	}
 
-	orphanLimit := 0
-	if !firstImport {
-		// No need to walk back the entire chain
-		orphanLimit = blkCnt + 50
-		log.Printf("Marking orphan blocks (going back %d blocks)...", orphanLimit)
-	} else {
-		log.Printf("Marking orphan blocks (whole chain)...")
-	}
-	if err := w.SetOrphans(orphanLimit); err != nil {
+	log.Printf("Marking orphan blocks...")
+	if err := w.SetOrphans(); err != nil {
 		log.Printf("Error marking orphans: %v", err)
 	}
 	log.Printf("Done marking orphan blocks.")
@@ -1011,11 +1004,7 @@ func createConstraints(db *sql.DB, verbose bool) error {
 // If the chain is split, i.e. there is more than one row at the
 // highest height, then no blocks in the split will be marked as
 // orphan, which is fine.
-func (w *PGWriter) SetOrphans(limit int) error {
-	var limitSql string
-	if limit > 0 {
-		limitSql = fmt.Sprintf("WHERE n < %d", limit)
-	}
+func (w *PGWriter) SetOrphans() error {
 	if _, err := w.db.Exec(fmt.Sprintf(`
 UPDATE blocks
    SET orphan = a.orphan
@@ -1025,7 +1014,7 @@ UPDATE blocks
       LEFT JOIN (
         WITH RECURSIVE recur(id, prevhash) AS (
           -- non-recursive term, executed once
-          SELECT id, prevhash, 0 AS n
+          SELECT id, prevhash
             FROM blocks
                             -- this should be faster than MAX(height)
            WHERE height IN (SELECT height FROM blocks ORDER BY height DESC LIMIT 1)
@@ -1033,17 +1022,16 @@ UPDATE blocks
           -- recursive term, recur refers to previous iteration result
           -- iteration stops when previous row prevhash finds no match OR
           -- if n reaches a limit (see limitSql above)
-            SELECT blocks.id, blocks.prevhash, n+1 AS n
+            SELECT blocks.id, blocks.prevhash
               FROM recur
               JOIN blocks ON blocks.hash = recur.prevhash
-            %s
         )
-        SELECT recur.id, recur.prevhash, n
+        SELECT recur.id, recur.prevhash
           FROM recur
       ) x ON blocks.id = x.id
    ) a
   WHERE blocks.id = a.id;
-       `, limitSql)); err != nil {
+       `)); err != nil {
 		return err
 	}
 	return nil
