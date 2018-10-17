@@ -46,6 +46,7 @@ type txInRec struct {
 	n       int
 	txIn    *blkchain.TxIn
 	idCache *txIdCache
+	sync    chan bool
 }
 
 type txOutRec struct {
@@ -59,6 +60,7 @@ type txOutRec struct {
 type BlockInfo struct {
 	*blkchain.Block
 	Height int
+	Sync   chan bool
 }
 
 type PGWriter struct {
@@ -94,15 +96,18 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 		}
 	}
 
-	bch := make(chan *BlockInfo, 8)
+	bch := make(chan *BlockInfo, 2)
 	wg.Add(1)
-	go pgBlockWorker(bch, &wg, db, firstImport, cacheSize, utxo)
 
-	return &PGWriter{
+	w := &PGWriter{
 		blockCh: bch,
 		wg:      &wg,
 		db:      db,
-	}, nil
+	}
+
+	go w.pgBlockWorker(bch, &wg, firstImport, cacheSize, utxo)
+
+	return w, nil
 }
 
 func (p *PGWriter) Close() {
@@ -114,48 +119,53 @@ func (p *PGWriter) WriteBlockInfo(b *BlockInfo) {
 	p.blockCh <- b
 }
 
-func (w *PGWriter) LastHeightHash() (int, blkchain.Uint256, error) {
-	_, height, hash, err := getLastHashAndHeight(w.db)
-	return height, blkchain.Uint256FromBytes(hash), err
+func (w *PGWriter) HeightAndHashes() (int, []blkchain.Uint256, error) {
+	return getHeightAndHashes(w.db)
 }
 
-func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstImport bool, cacheSize int, utxo isUTXOer) {
+func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, firstImport bool, cacheSize int, utxo isUTXOer) {
 	defer wg.Done()
 
-	bid, _, bhash, err := getLastHashAndHeight(db)
+	_, hashes, err := getHeightAndHashes(w.db)
 	if err != nil {
 		log.Printf("Error getting last hash and height, exiting: %v", err)
 		return
 	}
-	txid, err := getLastTxId(db)
+	bid, err := getLastBlockId(w.db)
+	if err != nil {
+		log.Printf("Error getting last block id, exiting: %v", err)
+		return
+	}
+	txid, err := getLastTxId(w.db)
 	if err != nil {
 		log.Printf("Error getting last tx id, exiting: %v", err)
 		return
 	}
 
 	blockCh := make(chan *blockRec, 2)
-	go pgBlockWriter(blockCh, db)
+	go pgBlockWriter(blockCh, w.db)
 
 	txCh := make(chan *txRec, 64)
-	go pgTxWriter(txCh, db)
+	go pgTxWriter(txCh, w.db)
 
 	txInCh := make(chan *txInRec, 64)
-	go pgTxInWriter(txInCh, db)
+	go pgTxInWriter(txInCh, w.db)
 
 	txOutCh := make(chan *txOutRec, 64)
-	go pgTxOutWriter(txOutCh, db, utxo)
+	go pgTxOutWriter(txOutCh, w.db, utxo)
 
 	writerWg.Add(4)
 
 	start := time.Now()
 
 	// nil utxo means this is coming from a btcnode, we do not need to skip blocks
-	if utxo != nil && len(bhash) > 0 {
-		log.Printf("PGWriter ignoring blocks up to hash %v", blkchain.Uint256FromBytes(bhash))
+	if utxo != nil && len(hashes) > 0 {
+		bhash := hashes[len(hashes)-1] // last hash in the list is the last hash
+		log.Printf("PGWriter ignoring blocks up to hash %v", bhash)
 		skip, last := 0, time.Now()
 		for b := range ch {
 			hash := b.Hash()
-			if bytes.Compare(bhash, hash[:]) == 0 {
+			if bytes.Compare(bhash[:], hash[:]) == 0 {
 				break
 			} else {
 				skip++
@@ -181,9 +191,31 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 	}
 
 	txcnt, last := 0, time.Now()
+	blkCnt := 0
 	for bi := range ch {
 		bid++
+		blkCnt++
 		hash := bi.Hash()
+
+		if bi.Height < 0 { // We have to look it up
+
+			height, hashes, err := getHeightAndHashes(w.db)
+			if err != nil {
+				log.Printf("pgBlockWorker() error: %v", err)
+			}
+
+			for _, h := range hashes {
+				if h == bi.PrevHash {
+					bi.Height = height + 1
+					break
+				}
+			}
+
+			if bi.Height < 0 {
+				log.Printf("pgBlockWorker: Could not connect block to a previous block on our chain, ignoring it.")
+				continue
+			}
+		}
 
 		blockCh <- &blockRec{
 			id:     bid,
@@ -254,7 +286,19 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 			if syncCh != nil {
 				<-syncCh
 			}
-			txInCh <- nil
+			if bi.Sync != nil {
+				// wait for it to finish
+				txInCh <- &txInRec{
+					sync: syncCh,
+				}
+				if syncCh != nil {
+					<-syncCh
+					bi.Sync <- true
+				}
+			} else {
+				// we con't care when it finishes
+				txInCh <- nil
+			}
 		} else if bid%50 == 0 {
 			// commit every N blocks
 			blockCh <- nil
@@ -280,43 +324,66 @@ func pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, db *sql.DB, firstIm
 	writerWg.Wait()
 	log.Printf("Workers finished.")
 
+	if blkCnt == 0 {
+		return
+	}
+
 	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d dupes: %d evictions: %d",
 		idCache.hits, float64(idCache.hits)/(float64(idCache.hits+idCache.miss)+0.0001)*100,
 		idCache.miss, idCache.cols, idCache.dups, idCache.evic)
 
 	verbose := firstImport
-	log.Printf("Creating indexes part 1 (if needed), please be patient, this may take a long time...")
-	if err := createIndexes1(db, verbose); err != nil {
-		log.Printf("Error creating indexes: %v", err)
-	}
-	if idCache.miss > 0 {
-		log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
-		if err := fixPrevoutTxId(db); err != nil {
-			log.Printf("Error fixing prevout_tx_id: %v", err)
-		}
-	} else {
-		log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
 
+	if firstImport {
+		log.Printf("Creating indexes part 1 (if needed), please be patient, this may take a long time...")
+		if err := createIndexes1(w.db, verbose); err != nil {
+			log.Printf("Error creating indexes: %v", err)
+		}
+
+		if idCache.miss > 0 {
+			log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
+			if err := fixPrevoutTxId(w.db); err != nil {
+				log.Printf("Error fixing prevout_tx_id: %v", err)
+			}
+		} else {
+			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
+
+		}
+
+		log.Printf("Creating indexes part 2 (if needed), please be patient, this may take a long time...")
+		if err := createIndexes2(w.db, verbose); err != nil {
+			log.Printf("Error creating indexes: %v", err)
+		}
+
+		log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
+		if err := createConstraints(w.db, verbose); err != nil {
+			log.Printf("Error creating constraints: %v", err)
+		}
 	}
-	log.Printf("Creating indexes part 2 (if needed), please be patient, this may take a long time...")
-	if err := createIndexes2(db, verbose); err != nil {
-		log.Printf("Error creating indexes: %v", err)
-	}
-	log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
-	if err := createConstraints(db, verbose); err != nil {
-		log.Printf("Error creating constraints: %v", err)
-	}
+
 	if firstImport {
 		log.Printf("Creating txins triggers.")
-		if err := createTxinsTriggers(db); err != nil {
+		if err := createTxinsTriggers(w.db); err != nil {
 			log.Printf("Error creating txins triggers: %v", err)
 		}
 	}
-	log.Printf("Marking orphan blocks...")
-	if err := setOrphans(db, 0); err != nil {
+
+	orphanLimit := 0
+	if !firstImport {
+		// No need to walk back the entire chain
+		orphanLimit = blkCnt + 50
+		log.Printf("Marking orphan blocks (going back %d blocks)...", orphanLimit)
+	} else {
+		log.Printf("Marking orphan blocks (whole chain)...")
+	}
+	if err := w.SetOrphans(orphanLimit); err != nil {
 		log.Printf("Error marking orphans: %v", err)
 	}
-	log.Printf("Indexes and constraints created.")
+	log.Printf("Done marking orphan blocks.")
+
+	if firstImport {
+		log.Printf("Indexes and constraints created.")
+	}
 }
 
 func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) {
@@ -393,11 +460,11 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 
 	}
 
-	log.Printf("Block writer channel closed, leaving.")
+	log.Printf("Block writer channel closed, commiting transaction.")
 	if err = commit(stmt, txn); err != nil {
 		log.Printf("Block commit error: %v", err)
 	}
-
+	log.Printf("Block writer done.")
 }
 
 func pgTxWriter(c chan *txRec, db *sql.DB) {
@@ -483,13 +550,14 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 		}
 	}
 
-	log.Printf("Tx writer channel closed, leaving.")
+	log.Printf("Tx writer channel closed, committing transaction.")
 	if err = commit(stmt, txn); err != nil {
 		log.Printf("Tx commit error: %v", err)
 	}
 	if err = commit(bstmt, btxn); err != nil {
 		log.Printf("Block Txs commit error: %v", err)
 	}
+	log.Printf("Tx writer done.")
 
 }
 
@@ -504,13 +572,16 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 	}
 
 	for tr := range c {
-		if tr == nil { // commit signal
+		if tr == nil || tr.txIn == nil { // commit signal
 			if err = commit(stmt, txn); err != nil {
 				log.Printf("Txin commit error: %v", err)
 			}
 			txn, stmt, err = begin(db, "txins", cols)
 			if err != nil {
 				log.Printf("ERROR (10): %v", err)
+			}
+			if tr != nil && tr.sync != nil {
+				tr.sync <- true
 			}
 			continue
 		}
@@ -544,10 +615,11 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 
 	}
 
-	log.Printf("TxIn writer channel closed, leaving.")
+	log.Printf("TxIn writer channel closed, committing transaction.")
 	if err = commit(stmt, txn); err != nil {
 		log.Printf("TxIn commit error: %v", err)
 	}
+	log.Printf("TxIn writer done.")
 }
 
 func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
@@ -602,10 +674,11 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 
 	}
 
-	log.Printf("TxOut writer channel closed, leaving.")
+	log.Printf("TxOut writer channel closed, committing transaction.")
 	if err = commit(stmt, txn); err != nil {
 		log.Printf("TxOut commit error: %v", err)
 	}
+	log.Printf("TxOut writer done.")
 }
 
 func commit(stmt *sql.Stmt, txn *sql.Tx) (err error) {
@@ -624,27 +697,54 @@ func commit(stmt *sql.Stmt, txn *sql.Tx) (err error) {
 	return nil
 }
 
-func getLastHashAndHeight(db *sql.DB) (int, int, []byte, error) {
+func getHeightAndHashes(db *sql.DB) (int, []blkchain.Uint256, error) {
 
-	rows, err := db.Query("SELECT id, height, hash FROM blocks ORDER BY height DESC LIMIT 1")
+	stmt := "SELECT height, hash FROM blocks " +
+		"WHERE height IN (SELECT MAX(height) FROM blocks) " +
+		"ORDER BY id "
+
+	rows, err := db.Query(stmt)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, nil, err
+	}
+	defer rows.Close()
+
+	var (
+		height int
+		hashes = make([]blkchain.Uint256, 0, 1)
+	)
+
+	for rows.Next() {
+		var hash []byte
+		if err := rows.Scan(&height, &hash); err != nil {
+			return 0, nil, err
+		}
+		hashes = append(hashes, blkchain.Uint256FromBytes(hash))
+	}
+	if len(hashes) > 0 {
+		return height, hashes, nil
+	}
+
+	// Initial height is -1, so that 1st block is height 0
+	return -1, nil, rows.Err()
+}
+
+func getLastBlockId(db *sql.DB) (int, error) {
+
+	rows, err := db.Query("SELECT id FROM blocks ORDER BY id DESC LIMIT 1")
+	if err != nil {
+		return 0, err
 	}
 	defer rows.Close()
 
 	if rows.Next() {
-		var (
-			id     int
-			height int
-			hash   []byte
-		)
-		if err := rows.Scan(&id, &height, &hash); err != nil {
-			return 0, 0, nil, err
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
 		}
-		return id, height, hash, nil
+		return id, nil
 	}
-	// Initial height is -1, so that 1st block is height 0
-	return 0, -1, nil, rows.Err()
+	return 0, rows.Err()
 }
 
 func getLastTxId(db *sql.DB) (int64, error) {
@@ -907,12 +1007,16 @@ func createConstraints(db *sql.DB, verbose bool) error {
 //
 // Then we LEFT JOIN the above to the blocks table, and where there is
 // no match (x.id IS NULL) we mark it as orphan.
-func setOrphans(db *sql.DB, limit int) error {
+//
+// If the chain is split, i.e. there is more than one row at the
+// highest height, then no blocks in the split will be marked as
+// orphan, which is fine.
+func (w *PGWriter) SetOrphans(limit int) error {
 	var limitSql string
 	if limit > 0 {
 		limitSql = fmt.Sprintf("WHERE n < %d", limit)
 	}
-	if _, err := db.Exec(fmt.Sprintf(`
+	if _, err := w.db.Exec(fmt.Sprintf(`
 UPDATE blocks
    SET orphan = a.orphan
   FROM (
@@ -920,11 +1024,15 @@ UPDATE blocks
       FROM blocks
       LEFT JOIN (
         WITH RECURSIVE recur(id, prevhash) AS (
+          -- non-recursive term, executed once
           SELECT id, prevhash, 0 AS n
             FROM blocks
                             -- this should be faster than MAX(height)
            WHERE height IN (SELECT height FROM blocks ORDER BY height DESC LIMIT 1)
           UNION ALL
+          -- recursive term, recur refers to previous iteration result
+          -- iteration stops when previous row prevhash finds no match OR
+          -- if n reaches a limit (see limitSql above)
             SELECT blocks.id, blocks.prevhash, n+1 AS n
               FROM recur
               JOIN blocks ON blocks.hash = recur.prevhash

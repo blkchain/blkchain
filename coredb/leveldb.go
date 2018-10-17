@@ -79,23 +79,24 @@ func (ibh *leveldbBlockHeader) BinRead(r io.Reader) (err error) {
 }
 
 type levelDbBlockHeaderIndex struct {
-	m                    map[int][]*leveldbBlockHeader
-	blocksPath           string
-	magic                uint32
-	height, maxHeight, n int
-	count                int
+	m          map[int][]*leveldbBlockHeader
+	blocksPath string
+	magic      uint32
+	height     int // current height
+	n          int // pos within height
+	count      int
 }
 
 func (bi *levelDbBlockHeaderIndex) Next() bool {
-	if len(bi.m) == 0 { // just in case
-		return false
-	}
-	if bi.height > bi.maxHeight {
+	if len(bi.m) == 0 {
 		return false
 	}
 	if bi.n < len(bi.m[bi.height])-1 {
 		bi.n++
 	} else {
+		if len(bi.m[bi.height+1]) == 0 {
+			return false
+		}
 		bi.height++
 		bi.n = 0
 	}
@@ -134,6 +135,10 @@ func (bi *levelDbBlockHeaderIndex) Count() int {
 
 func (bi *levelDbBlockHeaderIndex) CurrentHeight() int {
 	return bi.height
+}
+
+func (bi *levelDbBlockHeaderIndex) Close() error {
+	return nil
 }
 
 func (bi *levelDbBlockHeaderIndex) ReadBlock() (*blkchain.Block, error) {
@@ -193,10 +198,6 @@ func ReadLevelDbBlockHeaderIndex(path, blocksPath string, magic uint32, startHei
 			continue
 		}
 
-		if int(bh.Height) > result.maxHeight {
-			result.maxHeight = int(bh.Height)
-		}
-
 		if list, ok := result.m[int(bh.Height)]; !ok {
 			result.m[int(bh.Height)] = []*leveldbBlockHeader{&bh}
 		} else {
@@ -205,14 +206,14 @@ func ReadLevelDbBlockHeaderIndex(path, blocksPath string, magic uint32, startHei
 		result.count++
 	}
 
-	log.Printf("Read %d block header entries, maxHeight: %d.", result.count, result.maxHeight)
+	log.Printf("Read %d block header entries.", result.count)
 
 	// Eliminate orphans
-	mh, c, err := eliminateOrphans(result.m, result.maxHeight, result.count)
+	count, err := eliminateOrphans(result.m)
 	if err != nil {
 		return nil, err
 	}
-	result.maxHeight, result.count = mh, c
+	result.count = count
 
 	return result, nil
 }
@@ -265,20 +266,32 @@ func (r *ChainStateReader) GetUTXO() (*UTXO, error) {
 // Eliminate orphans by walking the chan backwards and whenever we
 // see more than one block at a height, picking the one that
 // matches its descendant's PrevHash.
-func eliminateOrphans(m map[int][]*leveldbBlockHeader, maxHeight, count int) (_maxHeight, _count int, err error) {
-	// Find minHeight
-	minHeight := maxHeight
-	for k, _ := range m {
-		if minHeight > k {
-			minHeight = k
+func eliminateOrphans(m map[int][]*leveldbBlockHeader) (int, error) {
+
+	minHeight, maxHeight, count := -1, -1, 0
+
+	// Find min, max and count
+	for h, v := range m {
+		if minHeight > h || minHeight == -1 {
+			minHeight = h
 		}
+		if maxHeight < h || maxHeight == -1 {
+			maxHeight = h
+		}
+		count += len(v)
 	}
 
-	if len(m[maxHeight]) > 1 {
-		return 0, 0, fmt.Errorf("Chain is presently at a split, cannot continue.")
+	// It is possible that we are at a split, i.e. more than block
+	// exists at max height. In this specific case (levelDb import),
+	// we can just delete them until the main chain unity is found.
+	for h := maxHeight; len(m[h]) > 1 && h >= minHeight; h-- {
+		log.Printf("Chain is split at heighest height, ignoring height %d", h)
+		delete(m, h)
+		maxHeight--
 	}
+
 	prevHash := m[maxHeight][0].PrevHash
-	for h := maxHeight - 1; h > minHeight; h-- {
+	for h := maxHeight - 1; h >= minHeight; h-- {
 		if len(m[h]) > 1 { // More than one block at this height
 			for _, bh := range m[h] {
 				if bh.Hash() == prevHash {
@@ -289,20 +302,14 @@ func eliminateOrphans(m map[int][]*leveldbBlockHeader, maxHeight, count int) (_m
 				}
 			}
 			if len(m[h]) != 1 {
-				return 0, 0, fmt.Errorf("Problem finding valid parent when eliminating orphans.")
+				return count, fmt.Errorf("Problem finding valid parent when eliminating orphans.")
 			}
 		}
 
 		if len(m[h]) > 0 {
 			prevHash = m[h][0].PrevHash
-		} else {
-			// With levelDb it's somehow possible we're missing a
-			// block. In which case reduce maxHeight by -2
-			if h < maxHeight {
-				log.Printf("No block header at height %d, reducing maxHeight to: %d", h, h-2)
-				maxHeight = h - 2
-			}
 		}
 	}
-	return maxHeight, count, nil
+
+	return count, nil
 }

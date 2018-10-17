@@ -25,4 +25,5 @@ type BlockHeaderIndex interface {
 	Next() bool
 	BlockHeader() *BlockHeader
 	ReadBlock() (*Block, error)
+	Close() error
 }

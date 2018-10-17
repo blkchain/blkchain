@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ func main() {
 	chainStatePath := flag.String("chainstate", "", "/path/to/blocks/chainstate (levelDb UTXO set)")
 	testNet := flag.Bool("testnet", false, "Use testnet magic")
 	cacheSize := flag.Int("cache-size", 1024*1024*30, "Tx hashes to cache for pervout_tx_id")
+	wait := flag.Bool("wait", false, "Keep on waiting for blocks from Bitcoin node")
 
 	flag.Parse()
 
@@ -35,6 +37,10 @@ func main() {
 
 	if *blocksPath != "" && *nodeAddr != "" {
 		log.Fatalf("-blocks and -nodeAddr are mutually exclusive")
+	}
+
+	if *wait && *nodeAddr == "" {
+		log.Fatalf("wait can only be specified with nodeAddr")
 	}
 
 	if *indexPath == "" {
@@ -55,7 +61,8 @@ func main() {
 	if *nodeAddr != "" {
 		// Get blocks from a node
 		tmout := time.Duration(*nodeTmout) * time.Second
-		processEverythingBtcNode(*connStr, *nodeAddr, tmout, *cacheSize)
+		processEverythingBtcNode(*connStr, *nodeAddr, tmout, *cacheSize, *wait)
+
 	} else {
 		// Get block from levelDb
 		if err := setRLimit(1024); err != nil { // LevelDb opens many files!
@@ -67,29 +74,7 @@ func main() {
 
 }
 
-func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cacheSize int) {
-
-	writer, err := db.NewPGWriter(dbconnect, cacheSize, nil)
-	if err != nil {
-		log.Fatalf("ERROR: %v", err)
-	}
-
-	lastHeight, lastHash, err := writer.LastHeightHash()
-	if err != nil {
-		log.Fatalf("ERROR: %v", err)
-	}
-
-	log.Printf("Reading block headers from Node (%s)...", addr)
-	bhs, err := btcnode.ReadBtcnodeBlockHeaderIndex(addr, tmout, lastHash, lastHeight)
-	if err != nil {
-		log.Fatalf("ERROR: %v", err)
-		return
-	}
-	log.Printf("Read %d block headers.", bhs.Count())
-	if bhs.Count() == 0 {
-		log.Fatalf("Nothing to do.")
-		return
-	}
+func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cacheSize int, wait bool) {
 
 	// monitor ctrl-c
 	interrupt := make(chan bool, 1)
@@ -102,13 +87,116 @@ func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cache
 		interrupt <- true
 	}()
 
-	if err := processBlocks(writer, bhs, interrupt); err != nil {
-		log.Printf("Error processing blocks: %v", err)
+	writer, err := db.NewPGWriter(dbconnect, cacheSize, nil)
+	if err != nil {
+		log.Printf("Error creating writer: %v", err)
+		return
+	}
+
+	for {
+		count, err := btcNodeCatchUp(writer, addr, tmout, cacheSize, interrupt)
+		if err != nil {
+			log.Printf("Error catching up from btc node: %v", err)
+			return
+		}
+
+		if count == 0 {
+			log.Printf("Node has no more new headers, catch up done.")
+			break
+		}
+	}
+
+	if wait {
+		processEachNewBlock(writer, addr, tmout, interrupt)
 	}
 
 	log.Printf("Closing channel, waiting for workers to finish...")
 	writer.Close()
 	log.Printf("All done.")
+}
+
+func btcNodeCatchUp(writer *db.PGWriter, addr string, tmout time.Duration, cacheSize int, interrupt chan bool) (int, error) {
+
+	lastHeight, lastHashes, err := writer.HeightAndHashes()
+	if err != nil {
+		return 0, err
+	}
+
+	log.Printf("Reading block headers from Node (%s)...", addr)
+	bhs, err := btcnode.ReadBtcnodeBlockHeaderIndex(addr, tmout, lastHeight, lastHashes)
+	if err != nil {
+		return 0, err
+	}
+
+	log.Printf("Read %d block headers.", bhs.Count())
+	if bhs.Count() == 0 {
+		bhs.Close()
+		return 0, nil // This is not an error
+	}
+
+	if err := processBlocks(writer, bhs, true, interrupt); err != nil {
+		return 0, err
+	}
+
+	bhs.Close()
+
+	return bhs.Count(), nil
+}
+
+func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, interrupt chan bool) {
+
+	log.Printf("Connecting to Node (%s)...", addr)
+	node, err := btcnode.ConnectToNode(addr, tmout)
+	if err != nil {
+		log.Fatalf("ERROR: %v", err)
+	}
+
+	blkCh := make(chan *blkchain.Block, 8)
+
+	var blkChWg sync.WaitGroup
+
+	go func() {
+		blkChWg.Add(1)
+		defer blkChWg.Done()
+		for blk := range blkCh {
+
+			bi := &db.BlockInfo{
+				Block:  blk,
+				Height: -1, // Means the DB layer will figure it out
+				Sync:   make(chan bool),
+			}
+
+			writer.WriteBlockInfo(bi)
+			log.Printf("Queued block %v for writing.", blk.Hash())
+
+			<-bi.Sync
+
+			go func() {
+				log.Printf("Marking orphan blocks going back 10...")
+				writer.SetOrphans(10)
+				log.Printf("Marking orphan blocks done.")
+			}()
+		}
+	}()
+
+	for {
+		log.Printf("Waiting for a block...")
+
+		blk, err := node.WaitForBlock(interrupt)
+		if err != nil {
+			log.Fatalf("ERROR: %v", err)
+		}
+
+		log.Printf("Received a block: %v", blk.Hash())
+		blkCh <- blk
+
+		if len(interrupt) > 0 {
+			close(blkCh)
+			blkChWg.Wait()
+			break
+		}
+	}
+	log.Printf("Exiting processEachNewBlock().")
 }
 
 func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int) {
@@ -124,7 +212,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 		log.Fatalf("ERROR: %v", err)
 	}
 
-	lastHeight, _, err := writer.LastHeightHash()
+	lastHeight, _, err := writer.HeightAndHashes()
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
@@ -161,7 +249,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 		interrupt <- true
 	}()
 
-	if err := processBlocks(writer, bhs, interrupt); err != nil {
+	if err := processBlocks(writer, bhs, false, interrupt); err != nil {
 		log.Printf("Error processing blocks: %v", err)
 	}
 
@@ -170,7 +258,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 	log.Printf("All done.")
 }
 
-func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, interrupt chan bool) error {
+func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, sync bool, interrupt chan bool) error {
 	for bhs.Next() {
 		bh := bhs.BlockHeader()
 
@@ -189,7 +277,15 @@ func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, interrupt
 			Height: int(bhs.CurrentHeight()),
 		}
 
+		if sync {
+			bi.Sync = make(chan bool) // Let us know when done
+		}
+
 		writer.WriteBlockInfo(bi)
+		if sync {
+			<-bi.Sync // Wait for it to be commited
+		}
+
 		if len(interrupt) > 0 {
 			break
 		}

@@ -19,11 +19,12 @@ type btcNode struct {
 	tmout     time.Duration
 	headersCh chan []*wire.BlockHeader
 	blockCh   chan *wire.MsgBlock
+	invCh     chan *wire.MsgInv
 
-	startHash            blkchain.Uint256
-	height, maxHeight, n int
-	count                int
-	byHeight             map[int][]*blkchain.BlockHeader
+	height   int // current height
+	n        int // pos within height
+	count    int
+	byHeight map[int][]*blkchain.BlockHeader
 }
 
 type heightBH struct {
@@ -40,20 +41,18 @@ func (b *btcNode) CurrentHeight() int {
 }
 
 func (b *btcNode) Next() bool {
-
-	if len(b.byHeight) == 0 { // just in case
-		return false
-	}
-	if b.height > b.maxHeight {
+	if len(b.byHeight) == 0 {
 		return false
 	}
 	if b.n < len(b.byHeight[b.height])-1 {
 		b.n++
 	} else {
+		if len(b.byHeight[b.height+1]) == 0 {
+			return false
+		}
 		b.height++
 		b.n = 0
 	}
-
 	return true
 }
 
@@ -69,20 +68,25 @@ func (b *btcNode) ReadBlock() (*blkchain.Block, error) {
 	return b.getBlock(bh.Hash())
 }
 
-func (b *btcNode) getHeaders() error {
+func (b *btcNode) getHeaders(startHashes []blkchain.Uint256, startHeight int) error {
 
 	b.headersCh = make(chan []*wire.BlockHeader)
 
 	byPrevHash := make(map[blkchain.Uint256][]*heightBH, 2000)
 
-	lastHash := chainhash.Hash(b.startHash)
+	lastHashes := startHashes
 	for {
 
-		// This avoids a subtle bug whereby we pass a pointer to an
-		// array which later modify, and since it's a point it gets
-		// modified where we passed it to as well.
-		lhCopy := lastHash
-		b.PushGetHeadersMsg(blockchain.BlockLocator{&lhCopy}, &chainhash.Hash{})
+		bLocator := make(blockchain.BlockLocator, len(lastHashes))
+		for i, hash := range lastHashes {
+			// This avoids a subtle issue/bug? whereby we pass a
+			// pointer to an array which we later modify, and since it's
+			// a pointer it gets modified where we passed it to as well.
+			hCopy := chainhash.Hash(hash)
+			bLocator[i] = &hCopy
+		}
+		// NB: The node return the first header *after* locator
+		b.PushGetHeadersMsg(bLocator, &chainhash.Hash{})
 
 		var hdrs []*wire.BlockHeader
 		select {
@@ -92,7 +96,7 @@ func (b *btcNode) getHeaders() error {
 		}
 
 		if len(hdrs) == 0 { // No more headers
-			log.Printf("No more headers.")
+			log.Printf("End of headers (for now).")
 			break
 		} else {
 			log.Printf("Received batch of %d headers.", len(hdrs))
@@ -114,12 +118,17 @@ func (b *btcNode) getHeaders() error {
 			}
 			b.count++
 
-			lastHash = chainhash.Hash(bh.Hash())
+			lastHashes = []blkchain.Uint256{bh.Hash()}
 		}
 	}
 
+	if len(byPrevHash) == 0 { // Nothing to do
+		return nil
+	}
+
 	// Assign heights
-	setChildrenHeight(byPrevHash, b.startHash, b.height)
+	setChildrenHeight(byPrevHash, startHashes, startHeight)
+	b.height = startHeight // this is current height - 1
 
 	if b.byHeight == nil {
 		b.byHeight = make(map[int][]*blkchain.BlockHeader, len(byPrevHash))
@@ -132,17 +141,14 @@ func (b *btcNode) getHeaders() error {
 			} else {
 				b.byHeight[hbh.height] = append(list, hbh.bh)
 			}
-			if b.maxHeight < hbh.height {
-				b.maxHeight = hbh.height
-			}
 		}
 	}
 
-	mh, c, err := eliminateOrphans(b.byHeight, b.maxHeight, b.count)
+	count, err := eliminateOrphans(b.byHeight)
 	if err != nil {
 		return err
 	}
-	b.maxHeight, b.count = mh, c
+	b.count = count
 
 	return nil
 
@@ -226,35 +232,35 @@ func (b *btcNode) getBlock(hash blkchain.Uint256) (*blkchain.Block, error) {
 }
 
 // Recursively (from lowest height) assign height.
-func setChildrenHeight(byPrevHash map[blkchain.Uint256][]*heightBH, parentHash blkchain.Uint256, parentHeight int) {
-	for _, child := range byPrevHash[parentHash] {
-		child.height = parentHeight + 1
-		// log.Printf("%v %v", child.height, child.bh.Hash())
-		setChildrenHeight(byPrevHash, child.bh.Hash(), parentHeight+1)
+func setChildrenHeight(byPrevHash map[blkchain.Uint256][]*heightBH, parentHashes []blkchain.Uint256, parentHeight int) {
+	for _, parentHash := range parentHashes {
+		for _, child := range byPrevHash[parentHash] {
+			child.height = parentHeight + 1
+			// log.Printf("%v %v", child.height, child.bh.Hash())
+			setChildrenHeight(byPrevHash, []blkchain.Uint256{child.bh.Hash()}, parentHeight+1)
+		}
 	}
 }
 
-func ReadBtcnodeBlockHeaderIndex(addr string, tmout time.Duration, startHash blkchain.Uint256, startHeight int) (blkchain.BlockHeaderIndex, error) {
+func ReadBtcnodeBlockHeaderIndex(addr string, tmout time.Duration, height int, hashes []blkchain.Uint256) (blkchain.BlockHeaderIndex, error) {
 
-	node, err := connectToNode(addr, tmout, startHash, startHeight)
+	node, err := ConnectToNode(addr, tmout)
 	if err != nil {
 		return nil, err
 	}
-	node.tmout = tmout
 
 	// Get headers
-	if err := node.getHeaders(); err != nil {
+	if err := node.getHeaders(hashes, height); err != nil {
 		return nil, err
 	}
 
 	return node, nil
 }
 
-func connectToNode(addr string, tmout time.Duration, startHash blkchain.Uint256, startHeight int) (*btcNode, error) {
+func ConnectToNode(addr string, tmout time.Duration) (*btcNode, error) {
 
 	result := &btcNode{
-		height:    startHeight,
-		startHash: startHash,
+		tmout: tmout,
 	}
 
 	verackCh := make(chan bool)
@@ -277,6 +283,11 @@ func connectToNode(addr string, tmout time.Duration, startHash blkchain.Uint256,
 			OnHeaders: func(p *peer.Peer, msg *wire.MsgHeaders) {
 				if result.headersCh != nil {
 					result.headersCh <- msg.Headers
+				}
+			},
+			OnInv: func(p *peer.Peer, msg *wire.MsgInv) {
+				if result.invCh != nil {
+					result.invCh <- msg
 				}
 			},
 		},
@@ -307,24 +318,86 @@ func connectToNode(addr string, tmout time.Duration, startHash blkchain.Uint256,
 	return result, nil
 }
 
-// Eliminate orphans by walking the chan backwards and whenever we
-// see more than one block at a height, picking the one that
-// matches its descendant's PrevHash.
-func eliminateOrphans(m map[int][]*blkchain.BlockHeader, maxHeight, count int) (_maxHeight, _count int, err error) {
-	// Find minHeight
-	minHeight := maxHeight
-	for k, _ := range m {
-		if minHeight > k {
-			minHeight = k
+func (b *btcNode) Close() error {
+	b.Disconnect()
+	return nil
+}
+
+func (b *btcNode) WaitForBlock(interrupt chan bool) (*blkchain.Block, error) {
+
+	if interrupt == nil {
+		interrupt = make(chan bool)
+	}
+
+	if b.invCh == nil {
+		b.invCh = make(chan *wire.MsgInv)
+	}
+
+	for {
+
+		var msg *wire.MsgInv
+		select {
+		case msg = <-b.invCh:
+		case <-interrupt:
+			return nil, fmt.Errorf("Interrupted.")
+		}
+
+		if msg == nil {
+			return nil, fmt.Errorf("Received nil message?")
+		}
+
+		for _, inv := range msg.InvList {
+
+			if inv.Type == wire.InvTypeBlock || inv.Type == wire.InvTypeWitnessBlock {
+				// NB: Seems like it's always InvTypeBlock, never InvTypeWitnessBlock.
+
+				hash := blkchain.Uint256(inv.Hash)
+				blk, err := b.getBlock(hash)
+
+				if err != nil {
+					return nil, err
+				}
+
+				return blk, nil
+
+			}
+
 		}
 	}
 
-	if len(m[maxHeight]) > 1 {
-		return 0, 0, fmt.Errorf("Chain is presently at a split, cannot continue.")
+	return nil, nil
+}
+
+// Eliminate orphans by walking the chan backwards and whenever we
+// see more than one block at a height, picking the one that
+// matches its descendant's PrevHash.
+func eliminateOrphans(m map[int][]*blkchain.BlockHeader) (int, error) {
+
+	minHeight, maxHeight, count := -1, -1, 0
+
+	// Find min, max and count
+	for h, v := range m {
+		if minHeight > h || minHeight == -1 {
+			minHeight = h
+		}
+		if maxHeight < h || maxHeight == -1 {
+			maxHeight = h
+		}
+		count += len(v)
 	}
+
+	// It is possible that we are at a split, i.e. more than block
+	// exists at max height.  we can just delete them until the main
+	// chain unity is found. TODO: We can do better.
+	for h := maxHeight; len(m[h]) > 1 && h >= minHeight; h-- {
+		log.Printf("Chain is split at heighest height, ignoring height %d", h)
+		delete(m, h)
+		maxHeight--
+	}
+
 	prevHash := m[maxHeight][0].PrevHash
-	for h := maxHeight - 1; h > minHeight; h-- {
-		if len(m[h]) > 1 {
+	for h := maxHeight - 1; h >= minHeight; h-- {
+		if len(m[h]) > 1 { // More than one block at this height
 			for _, bh := range m[h] {
 				if bh.Hash() == prevHash {
 					m[h] = []*blkchain.BlockHeader{bh}
@@ -334,18 +407,14 @@ func eliminateOrphans(m map[int][]*blkchain.BlockHeader, maxHeight, count int) (
 				}
 			}
 			if len(m[h]) != 1 {
-				return 0, 0, fmt.Errorf("Problem finding valid parent when eliminating orphans.")
+				return count, fmt.Errorf("Problem finding valid parent when eliminating orphans.")
 			}
 		}
+
 		if len(m[h]) > 0 {
 			prevHash = m[h][0].PrevHash
-		} else {
-			// It's possible we're missing a block. In which case reduce maxHeight by -2 (yes)
-			if h < maxHeight {
-				log.Printf("No block header at height %d, reducing maxHeight to: %d", h, h-2)
-				maxHeight = h - 2
-			}
 		}
 	}
-	return maxHeight, count, nil
+
+	return count, nil
 }
