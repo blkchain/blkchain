@@ -22,49 +22,13 @@ import (
 
 var writerWg sync.WaitGroup
 
-type blockRec struct {
-	id     int
-	height int
-	block  *blkchain.Block
-	hash   blkchain.Uint256
-	orphan bool
-	sync   chan bool
-}
-
-type txRec struct {
-	id      int64
-	blockId int
-	n       int // position within block
-	tx      *blkchain.Tx
-	hash    blkchain.Uint256
-	sync    chan bool
-	dupe    bool // already seen
-}
-
-type txInRec struct {
-	txId    int64
-	n       int
-	txIn    *blkchain.TxIn
-	idCache *txIdCache
-	sync    chan bool
-}
-
-type txOutRec struct {
-	txId  int64
-	n     int
-	txOut *blkchain.TxOut
-	hash  blkchain.Uint256
-	sync  chan bool
-}
-
-type BlockInfo struct {
-	*blkchain.Block
-	Height int
-	Sync   chan bool
+type blockRecSync struct {
+	*BlockRec
+	sync chan bool
 }
 
 type PGWriter struct {
-	blockCh chan *BlockInfo
+	blockCh chan *blockRecSync
 	wg      *sync.WaitGroup
 	db      *sql.DB
 }
@@ -96,7 +60,7 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 		}
 	}
 
-	bch := make(chan *BlockInfo, 2)
+	bch := make(chan *blockRecSync, 2)
 	wg.Add(1)
 
 	w := &PGWriter{
@@ -115,15 +79,22 @@ func (p *PGWriter) Close() {
 	p.wg.Wait()
 }
 
-func (p *PGWriter) WriteBlockInfo(b *BlockInfo) {
-	p.blockCh <- b
+func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) {
+	bs := &blockRecSync{BlockRec: b}
+	if sync {
+		bs.sync = make(chan bool)
+	}
+	p.blockCh <- bs
+	if sync {
+		<-bs.sync
+	}
 }
 
 func (w *PGWriter) HeightAndHashes() (int, []blkchain.Uint256, error) {
 	return getHeightAndHashes(w.db)
 }
 
-func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, firstImport bool, cacheSize int, utxo isUTXOer) {
+func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, firstImport bool, cacheSize int, utxo isUTXOer) {
 	defer wg.Done()
 
 	_, hashes, err := getHeightAndHashes(w.db)
@@ -142,7 +113,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 		return
 	}
 
-	blockCh := make(chan *blockRec, 2)
+	blockCh := make(chan *blockRecSync, 2)
 	go pgBlockWriter(blockCh, w.db)
 
 	txCh := make(chan *txRec, 64)
@@ -164,7 +135,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 		log.Printf("PGWriter ignoring blocks up to hash %v", bhash)
 		skip, last := 0, time.Now()
 		for b := range ch {
-			hash := b.Hash()
+			hash := b.Block.Hash()
 			if bytes.Compare(bhash[:], hash[:]) == 0 {
 				break
 			} else {
@@ -187,17 +158,19 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 		// no firstImport means that the constraints already
 		// exist, and we need to wait for a tx to be commited before
 		// ins/outs can be inserted. Same with block/tx.
-		syncCh = make(chan bool, 0)
+		syncCh = make(chan bool)
 	}
 
 	txcnt, last := 0, time.Now()
 	blkCnt := 0
-	for bi := range ch {
+	for br := range ch {
 		bid++
 		blkCnt++
-		hash := bi.Hash()
 
-		if bi.Height < 0 { // We have to look it up
+		br.Id = bid
+		br.Hash = br.Block.Hash()
+
+		if br.Height < 0 { // We have to look it up
 
 			height, hashes, err := getHeightAndHashes(w.db)
 			if err != nil {
@@ -205,26 +178,21 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 			}
 
 			for _, h := range hashes {
-				if h == bi.PrevHash {
-					bi.Height = height + 1
+				if h == br.PrevHash {
+					br.Height = height + 1
 					break
 				}
 			}
 
-			if bi.Height < 0 {
+			if br.Height < 0 {
 				log.Printf("pgBlockWorker: Could not connect block to a previous block on our chain, ignoring it.")
 				continue
 			}
 		}
 
-		blockCh <- &blockRec{
-			id:     bid,
-			height: bi.Height,
-			block:  bi.Block,
-			hash:   hash,
-		}
+		blockCh <- br
 
-		for n, tx := range bi.Txs {
+		for n, tx := range br.Txs {
 			txid++
 			txcnt++
 
@@ -267,7 +235,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 
 		if !firstImport {
 			// commit after every block
-			blockCh <- &blockRec{
+			blockCh <- &blockRecSync{
 				sync: syncCh,
 			}
 			if syncCh != nil {
@@ -286,14 +254,14 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 			if syncCh != nil {
 				<-syncCh
 			}
-			if bi.Sync != nil {
+			if br.sync != nil {
 				// wait for it to finish
 				txInCh <- &txInRec{
 					sync: syncCh,
 				}
 				if syncCh != nil {
 					<-syncCh
-					bi.Sync <- true
+					br.sync <- true
 				}
 			} else {
 				// we con't care when it finishes
@@ -310,7 +278,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *BlockInfo, wg *sync.WaitGroup, first
 		// report progress
 		if time.Now().Sub(last) > 5*time.Second {
 			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f",
-				bi.Height, txcnt, time.Unix(int64(bi.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
+				br.Height, txcnt, time.Unix(int64(br.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
 			last = time.Now()
 		}
 	}
@@ -403,7 +371,7 @@ func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) 
 	return txn, stmt, nil
 }
 
-func pgBlockWriter(c chan *blockRec, db *sql.DB) {
+func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 	defer writerWg.Done()
 
 	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan"}
@@ -415,7 +383,7 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 
 	for br := range c {
 
-		if br == nil || br.block == nil { // commit signal
+		if br == nil || br.BlockRec == nil { // commit signal
 			if err = commit(stmt, txn); err != nil {
 				log.Printf("Block commit error: %v", err)
 			}
@@ -429,35 +397,22 @@ func pgBlockWriter(c chan *blockRec, db *sql.DB) {
 			continue
 		}
 
-		b := br.block
+		b := br.Block
 		_, err = stmt.Exec(
-			br.id,
-			br.height,
-			br.hash[:],
+			br.Id,
+			br.Height,
+			br.Hash[:],
 			int32(b.Version),
 			b.PrevHash[:],
 			b.HashMerkleRoot[:],
 			int32(b.Time),
 			int32(b.Bits),
 			int32(b.Nonce),
-			br.orphan,
+			br.Orphan,
 		)
 		if err != nil {
 			log.Printf("ERROR (3): %v", err)
 		}
-
-		if br.sync != nil {
-			// commit and send confirmation
-			if err = commit(stmt, txn); err != nil {
-				log.Printf("Block commit error (2): %v", err)
-			}
-			txn, stmt, err = begin(db, "blocks", cols)
-			if err != nil {
-				log.Printf("ERROR (2.5): %v", err)
-			}
-			br.sync <- true
-		}
-
 	}
 
 	log.Printf("Block writer channel closed, commiting transaction.")
@@ -528,25 +483,6 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 		)
 		if err != nil {
 			log.Printf("ERROR (7.5): %v", err)
-		}
-
-		if tr.sync != nil {
-			// commit and send confirmation
-			if err = commit(stmt, txn); err != nil {
-				log.Printf("Tx commit error: %v", err)
-			}
-			if err = commit(bstmt, btxn); err != nil {
-				log.Printf("Block Txs commit error: %v", err)
-			}
-			txn, stmt, err = begin(db, "txs", cols)
-			if err != nil {
-				log.Printf("ERROR (8): %v", err)
-			}
-			btxn, bstmt, err = begin(db, "block_txs", bcols)
-			if err != nil {
-				log.Printf("ERROR (8.5): %v", err)
-			}
-			tr.sync <- true
 		}
 	}
 
@@ -1021,10 +957,13 @@ func (w *PGWriter) SetOrphans(limit int) error {
 DO $$
 DECLARE
   min_id INT;
-
 BEGIN
--- select an id going back limit rows. a limit of 0 leaves min_id as 0
+-- select an id going back limit rows.
 SELECT MIN(id) INTO min_id FROM (SELECT id FROM blocks ORDER BY id DESC LIMIT %d) x;
+-- a limit of 0 leaves min_id as NULL, need to correct that
+IF (min_id IS NULL) THEN
+  min_id = -1;
+END IF;
 -- the key idea is that the recursive part goes back further than the
 -- limit imposed by min_id
 UPDATE blocks

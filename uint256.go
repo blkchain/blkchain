@@ -22,6 +22,16 @@ func (u Uint256) MarshalJSON() ([]byte, error) {
 	return json.Marshal(u.String())
 }
 
+// sql.Scanner so that pq can scan these values from postgres
+func (u *Uint256) Scan(value interface{}) error {
+	if b, ok := value.([]byte); !ok {
+		return fmt.Errorf("Unexpected type: %T", value)
+	} else {
+		copy(u[:], b)
+	}
+	return nil
+}
+
 // NB: we interpret this as little-endian. Traditionally Bitcoin
 // transaction ids are printed in big-endian, i.e. reverse of this.
 func ShaSha256(b []byte) Uint256 {

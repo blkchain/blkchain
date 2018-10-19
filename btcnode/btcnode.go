@@ -104,12 +104,12 @@ func (b *btcNode) getHeaders(startHashes []blkchain.Uint256, startHeight int) er
 
 		for _, h := range hdrs {
 			bh := &blkchain.BlockHeader{
-				Version:        uint32(h.Version),
+				Version:        blkchain.Uint32(h.Version),
 				PrevHash:       blkchain.Uint256(h.PrevBlock),
 				HashMerkleRoot: blkchain.Uint256(h.MerkleRoot),
-				Time:           uint32(h.Timestamp.Unix()),
-				Bits:           h.Bits,
-				Nonce:          h.Nonce,
+				Time:           blkchain.Uint32(h.Timestamp.Unix()),
+				Bits:           blkchain.Uint32(h.Bits),
+				Nonce:          blkchain.Uint32(h.Nonce),
 			}
 			if list, ok := byPrevHash[bh.PrevHash]; !ok {
 				byPrevHash[bh.PrevHash] = []*heightBH{&heightBH{0, bh}}
@@ -195,12 +195,12 @@ func blockFromMsgBlock(mb *wire.MsgBlock, magic uint32) *blkchain.Block {
 	blk := &blkchain.Block{
 		Magic: magic,
 		BlockHeader: &blkchain.BlockHeader{
-			Version:        uint32(mb.Header.Version),
+			Version:        blkchain.Uint32(mb.Header.Version),
 			PrevHash:       blkchain.Uint256(mb.Header.PrevBlock),
 			HashMerkleRoot: blkchain.Uint256(mb.Header.MerkleRoot),
-			Time:           uint32(mb.Header.Timestamp.Unix()),
-			Bits:           mb.Header.Bits,
-			Nonce:          mb.Header.Nonce,
+			Time:           blkchain.Uint32(mb.Header.Timestamp.Unix()),
+			Bits:           blkchain.Uint32(mb.Header.Bits),
+			Nonce:          blkchain.Uint32(mb.Header.Nonce),
 		},
 		Txs: make(blkchain.TxList, 0, len(mb.Transactions)),
 	}

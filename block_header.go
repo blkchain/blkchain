@@ -5,12 +5,12 @@ import (
 )
 
 type BlockHeader struct {
-	Version        uint32
+	Version        Uint32
 	PrevHash       Uint256
-	HashMerkleRoot Uint256
-	Time           uint32
-	Bits           uint32
-	Nonce          uint32
+	HashMerkleRoot Uint256 `db:"merkleroot"`
+	Time           Uint32
+	Bits           Uint32
+	Nonce          Uint32
 }
 
 func (bh *BlockHeader) Hash() Uint256 {

@@ -100,13 +100,18 @@ func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cache
 			return
 		}
 
+		if len(interrupt) > 0 {
+			break
+		}
+
 		if count == 0 {
 			log.Printf("Node has no more new headers, catch up done.")
 			break
 		}
+
 	}
 
-	if wait {
+	if wait && len(interrupt) == 0 {
 		processEachNewBlock(writer, addr, tmout, interrupt)
 	}
 
@@ -160,16 +165,14 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 		defer blkChWg.Done()
 		for blk := range blkCh {
 
-			bi := &db.BlockInfo{
+			br := &db.BlockRec{
 				Block:  blk,
 				Height: -1, // Means the DB layer will figure it out
-				Sync:   make(chan bool),
 			}
 
-			writer.WriteBlockInfo(bi)
-			log.Printf("Queued block %v for writing.", blk.Hash())
-
-			<-bi.Sync
+			log.Printf("Writing block %v...", blk.Hash())
+			writer.WriteBlock(br, true)
+			log.Printf("Done writing block %v.", blk.Hash())
 
 			go func() {
 				log.Printf("Marking orphan blocks going back 10...")
@@ -184,7 +187,9 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 
 		blk, err := node.WaitForBlock(interrupt)
 		if err != nil {
-			log.Fatalf("ERROR: %v", err)
+			if len(interrupt) == 0 {
+				log.Fatalf("ERROR: %v", err)
+			}
 		}
 
 		log.Printf("Received a block: %v", blk.Hash())
@@ -272,19 +277,12 @@ func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, sync bool
 			break
 		}
 
-		bi := &db.BlockInfo{
+		br := &db.BlockRec{
 			Block:  b,
 			Height: int(bhs.CurrentHeight()),
 		}
 
-		if sync {
-			bi.Sync = make(chan bool) // Let us know when done
-		}
-
-		writer.WriteBlockInfo(bi)
-		if sync {
-			<-bi.Sync // Wait for it to be commited
-		}
+		writer.WriteBlock(br, sync)
 
 		if len(interrupt) > 0 {
 			break
