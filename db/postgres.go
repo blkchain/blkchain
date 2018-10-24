@@ -86,7 +86,9 @@ func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) {
 	}
 	p.blockCh <- bs
 	if sync {
-		<-bs.sync
+		if ok := <-bs.sync; !ok {
+			log.Printf("Error writing block: %v", b.Block.Hash())
+		}
 	}
 }
 
@@ -186,6 +188,9 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 
 			if br.Height < 0 {
 				log.Printf("pgBlockWorker: Could not connect block to a previous block on our chain, ignoring it.")
+				if br.sync != nil {
+					br.sync <- false
+				}
 				continue
 			}
 		}

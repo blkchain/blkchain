@@ -115,7 +115,10 @@ will result in the import process taking up ~3GB of RAM.
 After the initial import, the tool can "catch up" by importing new
 blocks not yet in the database. The catch up is many times slower than
 the initial import because it does not have the luxury of not having
-indexes and constraints.
+indexes and constraints. The catch up does not read LevelDb, it simply
+uses the Bitcoin protocol to request new blocks from the node. If you
+specify the `-wait` option, the import will wait for new blocks as
+they are announced and write them to the DB.
 
 ## PostgreSQL Tuning
 

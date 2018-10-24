@@ -2,6 +2,7 @@ package blkchain
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 )
@@ -10,11 +11,11 @@ import (
 // faster and safer. TODO: is it?
 type Uint256 [32]byte
 
-func (u Uint256) String() (s string) {
-	for i := 0; i < 32; i++ {
-		s += fmt.Sprintf("%02x", u[31-i])
+func (u Uint256) String() string {
+	for i := 0; i < 16; i++ {
+		u[i], u[31-i] = u[31-i], u[i]
 	}
-	return
+	return hex.EncodeToString(u[:])
 }
 
 // TODO This may be wrong, do we want this here?
@@ -43,4 +44,18 @@ func Uint256FromBytes(from []byte) Uint256 {
 	var result Uint256
 	copy(result[:], from)
 	return result
+}
+
+func Uint256FromString(from string) (Uint256, error) {
+	if len(from) != 32*2 {
+		return Uint256{}, fmt.Errorf("Incorrect length.")
+	}
+	b, err := hex.DecodeString(from)
+	if err != nil {
+		return Uint256{}, err
+	}
+	for i := 0; i < 16; i++ {
+		b[i], b[31-i] = b[31-i], b[i]
+	}
+	return Uint256FromBytes(b), nil
 }

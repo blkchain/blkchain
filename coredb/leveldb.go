@@ -181,7 +181,7 @@ func ReadLevelDbBlockHeaderIndex(path, blocksPath string, magic uint32, startHei
 
 	result := &levelDbBlockHeaderIndex{
 		m:          make(map[int][]*leveldbBlockHeader, 500000),
-		height:     startHeight,
+		height:     startHeight - 1, // because Next() will +1 height
 		blocksPath: blocksPath,
 		magic:      magic,
 	}
@@ -195,7 +195,9 @@ func ReadLevelDbBlockHeaderIndex(path, blocksPath string, magic uint32, startHei
 		}
 
 		if (bh.Status & BLOCK_VALID_CHAIN) != BLOCK_VALID_CHAIN {
-			continue
+			if bh.Height != 0 { // For some reason genesis block is not VALID_CHAIN
+				continue
+			}
 		}
 
 		if list, ok := result.m[int(bh.Height)]; !ok {

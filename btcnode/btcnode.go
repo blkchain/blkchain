@@ -323,7 +323,8 @@ func (b *btcNode) Close() error {
 	return nil
 }
 
-func (b *btcNode) WaitForBlock(interrupt chan bool) (*blkchain.Block, error) {
+// Wait for inventory of block(s) from the node.
+func (b *btcNode) WaitForBlock(interrupt chan bool) ([]*blkchain.Block, error) {
 
 	if interrupt == nil {
 		interrupt = make(chan bool)
@@ -346,6 +347,7 @@ func (b *btcNode) WaitForBlock(interrupt chan bool) (*blkchain.Block, error) {
 			return nil, fmt.Errorf("Received nil message?")
 		}
 
+		result := make([]*blkchain.Block, 0)
 		for _, inv := range msg.InvList {
 
 			if inv.Type == wire.InvTypeBlock || inv.Type == wire.InvTypeWitnessBlock {
@@ -358,10 +360,11 @@ func (b *btcNode) WaitForBlock(interrupt chan bool) (*blkchain.Block, error) {
 					return nil, err
 				}
 
-				return blk, nil
-
+				result = append(result, blk)
 			}
-
+		}
+		if len(result) > 0 {
+			return result, nil
 		}
 	}
 

@@ -185,15 +185,17 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 	for {
 		log.Printf("Waiting for a block...")
 
-		blk, err := node.WaitForBlock(interrupt)
+		blks, err := node.WaitForBlock(interrupt)
 		if err != nil {
 			if len(interrupt) == 0 {
 				log.Fatalf("ERROR: %v", err)
 			}
 		}
 
-		log.Printf("Received a block: %v", blk.Hash())
-		blkCh <- blk
+		for _, blk := range blks {
+			log.Printf("Received a block: %v", blk.Hash())
+			blkCh <- blk
+		}
 
 		if len(interrupt) > 0 {
 			close(blkCh)
