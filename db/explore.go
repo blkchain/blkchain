@@ -103,8 +103,9 @@ SELECT txid
   JOIN LATERAL (
     SELECT ARRAY_AGG(i.*  ORDER BY n) AS ins
       FROM (
-        SELECT n, prevout_hash, prevout_n, scriptsig, sequence, witness
-          FROM txins
+        SELECT n, ts.txid AS prevout_hash, prevout_n, scriptsig, sequence, witness
+          FROM txins ti
+          JOIN txs ts ON ti.prevout_tx_id = ts.id
          WHERE tx_id = t.id
       ) i
   ) i ON true
@@ -126,30 +127,3 @@ WHERE t.txid = $1
 
 	return &tx, nil
 }
-
-// func (e *Explorer) SelectBlockByHash(hash blkchain.Uint256) (*BlockRec, error) {
-// 	stmt := "SELECT id, height, hash, version, prevhash, merkleroot, time, bits, nonce, orphan " +
-// 		"FROM blocks " +
-// 		"WHERE hash = $1 "
-
-// 	var block BlockRec
-// 	if err := e.db.Get(&block, stmt, hash[:]); err != nil {
-// 		return nil, err
-// 	}
-
-// 	return &block, nil
-// }
-
-// func (e *Explorer) SelectBlocks(height, limit int) ([]*BlockRec, error) {
-// 	stmt := "SELECT id, height, hash, version, prevhash, merkleroot, time, bits, nonce, orphan " +
-// 		"FROM blocks " +
-// 		"WHERE height <= $1 " +
-// 		"ORDER BY height DESC LIMIT $2"
-
-// 	var blocks []*BlockRec
-// 	if err := e.db.Select(&blocks, stmt, height, limit); err != nil {
-// 		return nil, err
-// 	}
-
-// 	return blocks, nil
-// }

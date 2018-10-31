@@ -11,6 +11,11 @@ type BlockRec struct {
 	Height int
 	Hash   blkchain.Uint256
 	Orphan bool
+
+	size     int
+	baseSize int
+	weight   int
+	virtSize int
 }
 
 type txRec struct {
@@ -19,8 +24,14 @@ type txRec struct {
 	n       int // position within block
 	tx      *blkchain.Tx
 	hash    blkchain.Uint256
-	sync    chan bool
-	dupe    bool // already seen
+
+	size     int
+	baseSize int
+	weight   int
+	virtSize int
+
+	sync chan bool
+	dupe bool // already seen
 }
 
 type txInRec struct {

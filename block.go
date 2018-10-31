@@ -16,6 +16,22 @@ type Block struct {
 	Txs TxList
 }
 
+func (b *Block) BaseSize() int {
+	return b.BlockHeader.Size() + b.Txs.BaseSize()
+}
+
+func (b *Block) Size() int {
+	return b.BlockHeader.Size() + b.Txs.Size()
+}
+
+func (b *Block) Weight() int {
+	return b.BaseSize()*3 + b.Size()
+}
+
+func (b *Block) VirtualSize() int {
+	return b.BlockHeader.Size() + b.Txs.VirtualSize()
+}
+
 func (b *Block) BinRead(r io.Reader) error {
 	m, err := readMagic(r)
 	if err != nil {

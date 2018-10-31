@@ -71,6 +71,19 @@ func readCompactSize(r io.Reader) (uint64, error) {
 	return result, nil
 }
 
+func compactSizeSize(i uint64) int {
+	// https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_integer
+	switch {
+	case i < 0xfd:
+		return 1
+	case i < math.MaxUint16:
+		return 3
+	case i < math.MaxUint32:
+		return 5
+	}
+	return 9
+}
+
 func writeCompactSize(i uint64, w io.Writer) (err error) {
 	if i < 0xfd {
 		_, err = w.Write([]byte{byte(i)})

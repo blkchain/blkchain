@@ -20,6 +20,52 @@ func (tx *Tx) Hash() Uint256 {
 	return ShaSha256(buf.Bytes())
 }
 
+func (tx *Tx) BaseSize() int {
+	if !tx.SegWit {
+		return tx.Size()
+	}
+	version, locktime := 4, 4
+	return version + tx.TxIns.BaseSize() + tx.TxOuts.Size() + locktime
+}
+
+func (tx *Tx) Size() int {
+	version, locktime, segwit := 4, 4, 0
+	if tx.SegWit {
+		segwit = 2 // marker+flag
+	}
+	return version + segwit + tx.TxIns.Size() + tx.TxOuts.Size() + locktime
+}
+
+func (tx *Tx) Weight() int {
+	return tx.BaseSize()*3 + tx.Size()
+}
+
+func (tx *Tx) sigOpCount() (count int) {
+	for _, tin := range tx.TxIns {
+		count += tin.sigOpCount()
+	}
+	return count
+}
+
+func (tx *Tx) VirtualSize() int {
+	// TODO: This only an approximation
+	// We need script parsing code for precise result
+	const (
+		witnessScaleFactor   = 4
+		defaultBytesPerSigOp = 20
+		// maxPubkeysPerMultisig = 20
+	)
+
+	sigOpWeight := tx.sigOpCount() * witnessScaleFactor * defaultBytesPerSigOp
+	weight := tx.Weight()
+
+	if weight < sigOpWeight {
+		weight = sigOpWeight
+	}
+
+	return (weight + witnessScaleFactor - 1) / witnessScaleFactor
+}
+
 func (tx *Tx) BinRead(r io.Reader) (err error) {
 	var wcnt int
 
@@ -124,4 +170,36 @@ func (tl *TxList) BinRead(r io.Reader) error {
 		*tl = append(*tl, &tx)
 		return nil
 	})
+}
+
+func (tl *TxList) BaseSize() int {
+	result := compactSizeSize(uint64(len(*tl)))
+	for _, t := range *tl {
+		result += t.BaseSize()
+	}
+	return result
+}
+
+func (tl *TxList) Size() int {
+	result := compactSizeSize(uint64(len(*tl)))
+	for _, t := range *tl {
+		result += t.Size()
+	}
+	return result
+}
+
+func (tl *TxList) Weight() int {
+	result := compactSizeSize(uint64(len(*tl)))
+	for _, t := range *tl {
+		result += t.Weight()
+	}
+	return result
+}
+
+func (tl *TxList) VirtualSize() int {
+	result := compactSizeSize(uint64(len(*tl)))
+	for _, t := range *tl {
+		result += t.VirtualSize()
+	}
+	return result
 }

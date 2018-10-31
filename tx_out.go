@@ -7,6 +7,10 @@ type TxOut struct {
 	ScriptPubKey []byte
 }
 
+func (tout *TxOut) Size() int {
+	return 8 + compactSizeSize(uint64(len(tout.ScriptPubKey))) + len(tout.ScriptPubKey)
+}
+
 func (tout *TxOut) BinRead(r io.Reader) (err error) {
 	if err = BinRead(&tout.Value, r); err != nil {
 		return err
@@ -44,4 +48,12 @@ func (touts *TxOutList) BinWrite(w io.Writer) error {
 	return writeList(w, len(*touts), func(r io.Writer, i int) error {
 		return BinWrite((*touts)[i], w)
 	})
+}
+
+func (touts *TxOutList) Size() int {
+	result := compactSizeSize(uint64(len(*touts)))
+	for _, t := range *touts {
+		result += t.Size()
+	}
+	return result
 }

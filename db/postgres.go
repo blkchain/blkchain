@@ -51,13 +51,21 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 		if strings.Contains(err.Error(), "already exists") {
 			// this is fine, cancel deferred index/constraint creation
 			firstImport = false
+			log.Printf("Tables already exist, catching up.")
 		} else {
-			if utxo == nil {
-				return nil, fmt.Errorf("First import must be done with UTXO checker, i.e. from LevelDb directly. (utxo == nil)")
-			}
-			log.Printf("Tables created without indexes, which are created at the very end.")
 			return nil, err
 		}
+	}
+
+	if firstImport {
+		if utxo == nil {
+			return nil, fmt.Errorf("First import must be done with UTXO checker, i.e. from LevelDb directly. (utxo == nil)")
+		}
+		log.Printf("Tables created without indexes, which are created at the very end.")
+	}
+
+	if err := createPrevoutMissTable(db); err != nil {
+		return nil, err
 	}
 
 	bch := make(chan *blockRecSync, 2)
@@ -122,7 +130,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	go pgTxWriter(txCh, w.db)
 
 	txInCh := make(chan *txInRec, 64)
-	go pgTxInWriter(txInCh, w.db)
+	go pgTxInWriter(txInCh, w.db, firstImport)
 
 	txOutCh := make(chan *txOutRec, 64)
 	go pgTxOutWriter(txOutCh, w.db, utxo)
@@ -164,7 +172,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	}
 
 	txcnt, last := 0, time.Now()
-	blkCnt := 0
+	blkCnt, blkSz := 0, 0
 	for br := range ch {
 		bid++
 		blkCnt++
@@ -195,6 +203,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 			}
 		}
 
+		blkSz += br.Size()
 		blockCh <- br
 
 		for n, tx := range br.Txs {
@@ -272,7 +281,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 				// we con't care when it finishes
 				txInCh <- nil
 			}
-		} else if bid%50 == 0 {
+		} else if bid%30 == 0 {
 			// commit every N blocks
 			blockCh <- nil
 			txCh <- nil
@@ -282,8 +291,11 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 
 		// report progress
 		if time.Now().Sub(last) > 5*time.Second {
-			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f",
-				br.Height, txcnt, time.Unix(int64(br.Time), 0), float64(txcnt)/time.Now().Sub(start).Seconds())
+			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f KB/s: %02f",
+				br.Height, txcnt,
+				time.Unix(int64(br.Time), 0),
+				float64(txcnt)/time.Now().Sub(start).Seconds(),
+				float64(blkSz/1024)/time.Now().Sub(start).Seconds())
 			last = time.Now()
 		}
 	}
@@ -320,7 +332,6 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 			}
 		} else {
 			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
-
 		}
 
 		log.Printf("Creating indexes part 2 (if needed), please be patient, this may take a long time...")
@@ -332,6 +343,11 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		if err := createConstraints(w.db, verbose); err != nil {
 			log.Printf("Error creating constraints: %v", err)
 		}
+	}
+
+	log.Printf("Dropping _prevout_miss table.")
+	if err := dropPrevoutMissTable(w.db); err != nil {
+		log.Printf("Error dropping _prevout_miss table: %v", err)
 	}
 
 	if firstImport {
@@ -359,27 +375,10 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	}
 }
 
-func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) {
-	txn, err := db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if _, err := txn.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
-		return nil, nil, err
-	}
-
-	stmt, err := txn.Prepare(pq.CopyIn(table, cols...))
-	if err != nil {
-		return nil, nil, err
-	}
-	return txn, stmt, nil
-}
-
 func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan"}
+	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan", "size", "base_size", "weight", "virt_size"}
 
 	txn, stmt, err := begin(db, "blocks", cols)
 	if err != nil {
@@ -389,7 +388,7 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 	for br := range c {
 
 		if br == nil || br.BlockRec == nil { // commit signal
-			if err = commit(stmt, txn); err != nil {
+			if err = commit(stmt, txn, nil); err != nil {
 				log.Printf("Block commit error: %v", err)
 			}
 			txn, stmt, err = begin(db, "blocks", cols)
@@ -414,6 +413,10 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 			int32(b.Bits),
 			int32(b.Nonce),
 			br.Orphan,
+			br.Size(),
+			br.BaseSize(),
+			br.Weight(),
+			br.VirtualSize(),
 		)
 		if err != nil {
 			log.Printf("ERROR (3): %v", err)
@@ -421,7 +424,7 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 	}
 
 	log.Printf("Block writer channel closed, commiting transaction.")
-	if err = commit(stmt, txn); err != nil {
+	if err = commit(stmt, txn, nil); err != nil {
 		log.Printf("Block commit error: %v", err)
 	}
 	log.Printf("Block writer done.")
@@ -430,7 +433,7 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 func pgTxWriter(c chan *txRec, db *sql.DB) {
 	defer writerWg.Done()
 
-	cols := []string{"id", "txid", "version", "locktime"}
+	cols := []string{"id", "txid", "version", "locktime", "size", "base_size", "weight", "virt_size"}
 	bcols := []string{"block_id", "n", "tx_id"}
 
 	txn, stmt, err := begin(db, "txs", cols)
@@ -445,10 +448,10 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 
 	for tr := range c {
 		if tr == nil || tr.tx == nil { // commit signal
-			if err = commit(stmt, txn); err != nil {
+			if err = commit(stmt, txn, nil); err != nil {
 				log.Printf("Tx commit error: %v", err)
 			}
-			if err = commit(bstmt, btxn); err != nil {
+			if err = commit(bstmt, btxn, nil); err != nil {
 				log.Printf("Block Txs commit error: %v", err)
 			}
 			txn, stmt, err = begin(db, "txs", cols)
@@ -472,6 +475,10 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 				tr.hash[:],
 				int32(t.Version),
 				int32(t.LockTime),
+				t.Size(),
+				t.BaseSize(),
+				t.Weight(),
+				t.VirtualSize(),
 			)
 			if err != nil {
 				log.Printf("ERROR (7): %v", err)
@@ -492,31 +499,34 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 	}
 
 	log.Printf("Tx writer channel closed, committing transaction.")
-	if err = commit(stmt, txn); err != nil {
+	if err = commit(stmt, txn, nil); err != nil {
 		log.Printf("Tx commit error: %v", err)
 	}
-	if err = commit(bstmt, btxn); err != nil {
+	if err = commit(bstmt, btxn, nil); err != nil {
 		log.Printf("Block Txs commit error: %v", err)
 	}
 	log.Printf("Tx writer done.")
 
 }
 
-func pgTxInWriter(c chan *txInRec, db *sql.DB) {
+func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 	defer writerWg.Done()
 
-	cols := []string{"tx_id", "n", "prevout_hash", "prevout_n", "scriptsig", "sequence", "witness", "prevout_tx_id"}
+	cols := []string{"tx_id", "n", "prevout_tx_id", "prevout_n", "scriptsig", "sequence", "witness"}
 
 	txn, stmt, err := begin(db, "txins", cols)
 	if err != nil {
 		log.Printf("ERROR (9): %v", err)
 	}
 
+	misses := make([]*prevoutMiss, 0, 2000)
+
 	for tr := range c {
 		if tr == nil || tr.txIn == nil { // commit signal
-			if err = commit(stmt, txn); err != nil {
+			if err = commit(stmt, txn, misses); err != nil {
 				log.Printf("Txin commit error: %v", err)
 			}
+			misses = misses[:0]
 			txn, stmt, err = begin(db, "txins", cols)
 			if err != nil {
 				log.Printf("ERROR (10): %v", err)
@@ -538,26 +548,36 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB) {
 		var prevOutTxId *int64 = nil
 		if t.PrevOut.N != 0xffffffff { // coinbase
 			prevOutTxId = tr.idCache.check(t.PrevOut.Hash)
+
+			if prevOutTxId == nil { // cache miss
+				if firstImport {
+					// write it to the DB directly
+					if err := recordPrevoutMiss(db, tr.txId, tr.n, t.PrevOut.Hash); err != nil {
+						log.Printf("ERROR (10.7): %v", err)
+					}
+				} else {
+					// remember it, it will be written just when needed
+					misses = append(misses, &prevoutMiss{tr.txId, tr.n, t.PrevOut.Hash})
+				}
+			}
 		}
 
 		_, err = stmt.Exec(
 			tr.txId,
 			tr.n,
-			t.PrevOut.Hash[:],
+			prevOutTxId,
 			int32(t.PrevOut.N),
 			t.ScriptSig,
 			int32(t.Sequence),
 			wb,
-			prevOutTxId,
 		)
 		if err != nil {
 			log.Printf("ERROR (11): %v", err)
 		}
-
 	}
 
 	log.Printf("TxIn writer channel closed, committing transaction.")
-	if err = commit(stmt, txn); err != nil {
+	if err = commit(stmt, txn, misses); err != nil {
 		log.Printf("TxIn commit error: %v", err)
 	}
 	log.Printf("TxIn writer done.")
@@ -576,7 +596,7 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 	for tr := range c {
 
 		if tr == nil || tr.txOut == nil { // commit signal
-			if err = commit(stmt, txn); err != nil {
+			if err = commit(stmt, txn, nil); err != nil {
 				log.Printf("TxOut commit error: %v", err)
 			}
 			txn, stmt, err = begin(db, "txouts", cols)
@@ -591,9 +611,9 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 
 		var spent bool
 		if utxo != nil {
-			// TODO we probably do not need this when this is not the
-			// first import, as the triggers should maintain the correct
-			// spent status.
+			// NB: Some early unspent coins are not in the UTXO set,
+			// probably because they are not spendable? So the spent
+			// flag could also be interpeted as unspendable.
 			isUTXO, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
 			if err != nil {
 				log.Printf("ERROR (13.5): %v", err)
@@ -612,24 +632,47 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 		if err != nil {
 			log.Printf("ERROR (13.6): %v\n", err)
 		}
-
 	}
 
 	log.Printf("TxOut writer channel closed, committing transaction.")
-	if err = commit(stmt, txn); err != nil {
+	if err = commit(stmt, txn, nil); err != nil {
 		log.Printf("TxOut commit error: %v", err)
 	}
 	log.Printf("TxOut writer done.")
 }
 
-func commit(stmt *sql.Stmt, txn *sql.Tx) (err error) {
-	_, err = stmt.Exec()
+func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) {
+	txn, err := db.Begin()
 	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := txn.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
+		return nil, nil, err
+	}
+	stmt, err := txn.Prepare(pq.CopyIn(table, cols...))
+	if err != nil {
+		return nil, nil, err
+	}
+	return txn, stmt, nil
+}
+
+func commit(stmt *sql.Stmt, txn *sql.Tx, misses []*prevoutMiss) (err error) {
+	if _, err = stmt.Exec(); err != nil {
 		return err
 	}
-	err = stmt.Close()
-	if err != nil {
+	if err = stmt.Close(); err != nil {
 		return err
+	}
+	// We do this here because it is not possible to use Exec() during
+	// a pq.CopyIn operation, but we do want this done prior to the
+	// Commit.
+	if len(misses) > 0 {
+		if err = recordPrevoutMisses(txn, misses); err != nil {
+			return err
+		}
+		if err = fixPrevoutTxId(txn); err != nil { // also truncates _prevout_miss
+			return err
+		}
 	}
 	err = txn.Commit()
 	if err != nil {
@@ -706,10 +749,92 @@ func getLastTxId(db *sql.DB) (int64, error) {
 	return 0, rows.Err()
 }
 
+// This could be a db connection or a transaction
+type execer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+func createPrevoutMissTable(db execer) error {
+	sql := `
+     CREATE UNLOGGED TABLE IF NOT EXISTS _prevout_miss (
+          tx_id         BIGINT NOT NULL
+         ,n             INT NOT NULL
+         ,prevout_hash  BYTEA NOT NULL
+     );
+     TRUNCATE _prevout_miss;
+`
+	_, err := db.Exec(sql)
+	return err
+}
+
+func clearPrevoutMissTable(db execer) error {
+	_, err := db.Exec("TRUNCATE _prevout_miss")
+	return err
+}
+
+func dropPrevoutMissTable(db *sql.DB) error {
+	_, err := db.Exec("DROP TABLE IF EXISTS _prevout_miss")
+	return err
+}
+
+func recordPrevoutMiss(db *sql.DB, txId int64, n int, prevoutHash blkchain.Uint256) error {
+	stmt := "INSERT INTO _prevout_miss (tx_id, n, prevout_hash) VALUES($1, $2, $3)"
+	_, err := db.Exec(stmt, txId, n, prevoutHash[:])
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type prevoutMiss struct {
+	txId        int64
+	n           int
+	prevOutHash blkchain.Uint256
+}
+
+func recordPrevoutMisses(txn *sql.Tx, misses []*prevoutMiss) error {
+	stmt, err := txn.Prepare(pq.CopyIn("_prevout_miss", "tx_id", "n", "prevout_hash"))
+	if err != nil {
+		return err
+	}
+	for i, m := range misses {
+		if _, err = stmt.Exec(m.txId, m.n, m.prevOutHash[:]); err != nil {
+			return err
+		}
+		misses[i] = nil // so that they can be freed
+	}
+	if _, err = stmt.Exec(); err != nil {
+		return err
+	}
+	if err = stmt.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Most of the prevout_tx_id's should be already set during the
+// import, but we need to correct the remaining ones. You can likely
+// avoid it by increasing the txIdCache size. After the first import
+// it will be looked up on the fly as needed, but a larger cache is
+// still important.
+func fixPrevoutTxId(db execer) error {
+	if _, err := db.Exec(`
+           UPDATE txins i
+              SET prevout_tx_id = t.id
+             FROM _prevout_miss m
+             JOIN txs t ON m.prevout_hash = t.txid
+            WHERE i.tx_id = m.tx_id
+              AND i.n = m.n
+        `); err != nil {
+		return err
+	}
+	return clearPrevoutMissTable(db)
+}
+
 func createTables(db *sql.DB) error {
 	sqlTables := `
   CREATE TABLE blocks (
-   id           SERIAL
+   id           INT NOT NULL
   ,height       INT NOT NULL -- not same as id, because orphans.
   ,hash         BYTEA NOT NULL
   ,version      INT NOT NULL
@@ -719,35 +844,42 @@ func createTables(db *sql.DB) error {
   ,bits         INT NOT NULL
   ,nonce        INT NOT NULL
   ,orphan       BOOLEAN NOT NULL DEFAULT false
+  ,size         INT NOT NULL
+  ,base_size    INT NOT NULL
+  ,weight       INT NOT NULL
+  ,virt_size    INT NOT NULL
   );
 
   CREATE TABLE txs (
-   id            BIGSERIAL
+   id            BIGINT NOT NULL
   ,txid          BYTEA NOT NULL
   ,version       INT NOT NULL
   ,locktime      INT NOT NULL
+  ,size          INT NOT NULL
+  ,base_size     INT NOT NULL
+  ,weight        INT NOT NULL
+  ,virt_size     INT NOT NULL
   );
 
   CREATE TABLE block_txs (
    block_id      INT NOT NULL
-  ,n             INT NOT NULL
+  ,n             SMALLINT NOT NULL
   ,tx_id         BIGINT NOT NULL
   );
 
   CREATE TABLE txins (
    tx_id         BIGINT NOT NULL
-  ,n             INT NOT NULL
-  ,prevout_hash  BYTEA NOT NULL
+  ,n             SMALLINT NOT NULL
+  ,prevout_tx_id BIGINT   -- can be NULL for coinbase
   ,prevout_n     INT NOT NULL
   ,scriptsig     BYTEA NOT NULL
   ,sequence      INT NOT NULL
   ,witness       BYTEA
-  ,prevout_tx_id BIGINT
   );
 
   CREATE TABLE txouts (
    tx_id        BIGINT NOT NULL
-  ,n            INT NOT NULL
+  ,n            SMALLINT NOT NULL
   ,value        BIGINT NOT NULL
   ,scriptpubkey BYTEA NOT NULL
   ,spent        BOOL NOT NULL
@@ -1004,53 +1136,8 @@ END
 	return nil
 }
 
-// Most of the prevout_tx_id's should be already set during the
-// import, but we need to correct the remaining ones. This is a fairly
-// costly operation as it requires a txins table scan. You can likely
-// avoid it by increasing the txIdCache size. After the first import
-// it will be maintained by triggers.
-func fixPrevoutTxId(db *sql.DB) error {
-	if _, err := db.Exec(`
-       DO $$
-       BEGIN
-         -- existence of txins_pkey means it is already done
-         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-                         WHERE table_name = 'txs' AND constraint_name = 'txins_tx_id_fkey') THEN
-           UPDATE txins i
-              SET prevout_tx_id = t.id
-             FROM txs t
-            WHERE i.prevout_hash = t.txid
-              AND i.prevout_tx_id IS NULL
-              AND i.n <> -1;
-
-         END IF;
-       END
-       $$`); err != nil {
-		return err
-	}
-	return nil
-}
-
 func createTxinsTriggers(db *sql.DB) error {
 	if _, err := db.Exec(`
-CREATE OR REPLACE FUNCTION txins_before_trigger_func() RETURNS TRIGGER AS $$
-  BEGIN
-    IF (TG_OP = 'UPDATE' OR TG_OP = 'INSERT') THEN
-      IF NEW.prevout_n <> -1 AND NEW.prevout_tx_id IS NULL THEN
-        SELECT id INTO NEW.prevout_tx_id FROM txs WHERE txid = NEW.prevout_hash;
-        IF NOT FOUND THEN
-          RAISE EXCEPTION 'Unknown prevout_hash %', NEW.prevout_hash;
-        END IF;
-      END IF;
-      RETURN NEW;
-    END IF;
-    RETURN NULL;
-  END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER txins_before_trigger
-BEFORE INSERT OR UPDATE OR DELETE ON txins
-  FOR EACH ROW EXECUTE PROCEDURE txins_before_trigger_func();
 
 CREATE OR REPLACE FUNCTION txins_after_trigger_func() RETURNS TRIGGER AS $$
   BEGIN
@@ -1065,7 +1152,7 @@ CREATE OR REPLACE FUNCTION txins_after_trigger_func() RETURNS TRIGGER AS $$
         UPDATE txouts SET spent = TRUE
          WHERE tx_id = NEW.prevout_tx_id AND n = NEW.prevout_n;
         IF NOT FOUND THEN
-          RAISE EXCEPTION 'Unknown prevout_n % in txid % (id %)', NEW.prevout_n, NEW.prevout_hash, NEW.prevout_tx_id;
+          RAISE EXCEPTION 'Unknown tx_id:prevout_n combination: %:%', NEW.prevout_tx_id, NEW.prevout_n;
         END IF;
       END IF;
       RETURN NEW;

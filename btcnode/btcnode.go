@@ -340,6 +340,7 @@ func (b *btcNode) WaitForBlock(interrupt chan bool) ([]*blkchain.Block, error) {
 		select {
 		case msg = <-b.invCh:
 		case <-interrupt:
+			interrupt <- true // to keep len() > 0
 			return nil, fmt.Errorf("Interrupted.")
 		}
 

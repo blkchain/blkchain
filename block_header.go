@@ -19,6 +19,10 @@ func (bh *BlockHeader) Hash() Uint256 {
 	return ShaSha256(buf.Bytes())
 }
 
+func (bh *BlockHeader) Size() int {
+	return 4 + 32 + 32 + 4 + 4 + 4
+}
+
 type BlockHeaderIndex interface {
 	Count() int
 	CurrentHeight() int
