@@ -1002,6 +1002,36 @@ func createIndexes2(db *sql.DB, verbose bool) error {
 		return err
 	}
 
+	if verbose {
+		log.Printf("  - txouts address prefix index...")
+	}
+	if _, err := db.Exec(`
+           CREATE OR REPLACE FUNCTION extract_address(scriptPubKey BYTEA) RETURNS BYTEA AS $$
+           BEGIN
+             IF SUBSTR(scriptPubKey, 1, 3) = E'\\x76a914' THEN  -- P2PKH
+               RETURN SUBSTR(scriptPubKey, 4, 20);
+             ELSIF SUBSTR(scriptPubKey, 1, 2) = E'\\xa914' THEN -- P2SH
+               RETURN SUBSTR(scriptPubKey, 3, 20);
+             ELSIF SUBSTR(scriptPubKey, 1, 2) = E'\\x0014' THEN -- P2WPKH
+               RETURN SUBSTR(scriptPubKey, 3, 20);
+             ELSIF SUBSTR(scriptPubKey, 1, 2) = E'\\x0020' THEN -- P2WSH
+               RETURN SUBSTR(scriptPubKey, 3, 32);
+             END IF;
+             RETURN NULL;
+           END;
+           $$ LANGUAGE plpgsql IMMUTABLE;
+
+           CREATE OR REPLACE FUNCTION addr_prefix(scriptPubKey BYTEA) RETURNS BYTEA AS $$
+           BEGIN
+             RETURN SUBSTR(extract_address(scriptPubKey), 1, 5);
+           END;
+           $$ LANGUAGE plpgsql IMMUTABLE;
+
+           CREATE INDEX IF NOT EXISTS txouts_addr_prefix_idx ON txouts(addr_prefix(scriptpubkey));
+       `); err != nil {
+		return err
+	}
+
 	return nil
 }
 
