@@ -188,7 +188,7 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 		blks, err := node.WaitForBlock(interrupt)
 		if err != nil {
 			if len(interrupt) == 0 {
-				log.Fatalf("ERROR: %v", err)
+				log.Printf("ERROR: %v", err)
 			}
 		}
 

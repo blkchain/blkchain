@@ -127,3 +127,14 @@ WHERE t.txid = $1
 
 	return &tx, nil
 }
+
+func (e *Explorer) SelectHashType(hash blkchain.Uint256) (*string, error) {
+	stmt := "SELECT hash_type($1)"
+
+	var typ *string
+	if err := e.db.Get(&typ, stmt, hash[:]); err != nil {
+		return nil, err
+	}
+
+	return typ, nil
+}

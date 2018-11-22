@@ -963,6 +963,23 @@ func createIndexes1(db *sql.DB, verbose bool) error {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS block_txs_tx_id_idx ON block_txs(tx_id);"); err != nil {
 		return err
 	}
+	if verbose {
+		log.Printf("  - hash_type function...")
+	}
+	if _, err := db.Exec(`
+       CREATE OR REPLACE FUNCTION hash_type(_hash BYTEA) RETURNS TEXT AS $$
+       BEGIN
+         IF EXISTS (SELECT 1 FROM blocks WHERE hash = _hash) THEN
+           RETURN 'block';
+         ELSIF EXISTS (SELECT 1 FROM txs WHERE txid = _hash) THEN
+           RETURN 'tx';
+         END IF;
+         RETURN NULL;
+       END;
+       $$ LANGUAGE plpgsql;
+       `); err != nil {
+		return err
+	}
 	return nil
 }
 
