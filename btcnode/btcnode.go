@@ -68,13 +68,28 @@ func (b *btcNode) ReadBlock() (*blkchain.Block, error) {
 	return b.getBlock(bh.Hash())
 }
 
-func (b *btcNode) getHeaders(startHashes []blkchain.Uint256, startHeight int) error {
+func (b *btcNode) getHeaders(startHashes map[int][]blkchain.Uint256) error {
 
 	b.headersCh = make(chan []*wire.BlockHeader)
 
 	byPrevHash := make(map[blkchain.Uint256][]*heightBH, 2000)
 
-	lastHashes := startHashes
+	// initial lastHashes, must be in height reverse order as
+	// (contrary to docs) it seems to start at the first recognized
+	// blockhash, not the last one
+	lastHashes := make([]blkchain.Uint256, 0, len(startHashes))
+	var minHeight int
+	for h, _ := range startHashes {
+		if minHeight == 0 || minHeight > h {
+			minHeight = h
+		}
+	}
+	for i := len(startHashes) - 1; i >= 0; i-- {
+		for _, hash := range startHashes[minHeight+i] {
+			lastHashes = append(lastHashes, hash)
+		}
+	}
+
 	for {
 
 		bLocator := make(blockchain.BlockLocator, len(lastHashes))
@@ -85,7 +100,6 @@ func (b *btcNode) getHeaders(startHashes []blkchain.Uint256, startHeight int) er
 			hCopy := chainhash.Hash(hash)
 			bLocator[i] = &hCopy
 		}
-		// NB: The node return the first header *after* locator
 		b.PushGetHeadersMsg(bLocator, &chainhash.Hash{})
 
 		var hdrs []*wire.BlockHeader
@@ -127,8 +141,8 @@ func (b *btcNode) getHeaders(startHashes []blkchain.Uint256, startHeight int) er
 	}
 
 	// Assign heights
-	setChildrenHeight(byPrevHash, startHashes, startHeight)
-	b.height = startHeight // this is current height - 1
+	foundHeight := setChildrenHeight(byPrevHash, startHashes)
+	b.height = foundHeight // this is current height - 1
 
 	if b.byHeight == nil {
 		b.byHeight = make(map[int][]*blkchain.BlockHeader, len(byPrevHash))
@@ -231,18 +245,25 @@ func (b *btcNode) getBlock(hash blkchain.Uint256) (*blkchain.Block, error) {
 	return blockFromMsgBlock(block, blkchain.MainNetMagic), nil
 }
 
-// Recursively (from lowest height) assign height.
-func setChildrenHeight(byPrevHash map[blkchain.Uint256][]*heightBH, parentHashes []blkchain.Uint256, parentHeight int) {
-	for _, parentHash := range parentHashes {
-		for _, child := range byPrevHash[parentHash] {
-			child.height = parentHeight + 1
-			// log.Printf("%v %v", child.height, child.bh.Hash())
-			setChildrenHeight(byPrevHash, []blkchain.Uint256{child.bh.Hash()}, parentHeight+1)
+// Recursively (from lowest height) assign height. Return the
+// satisfied height from the given parentHashes (assuming all is well,
+// there should only be one because of how the nodes respond to
+// getheaders)
+func setChildrenHeight(byPrevHash map[blkchain.Uint256][]*heightBH, parentHashes map[int][]blkchain.Uint256) (foundHeight int) {
+	for parentHeight, parents := range parentHashes {
+		for _, parentHash := range parents {
+			for _, child := range byPrevHash[parentHash] {
+				child.height = parentHeight + 1
+				foundHeight = parentHeight // this height found children in the node response
+				// log.Printf("%v %v", child.height, child.bh.Hash())
+				setChildrenHeight(byPrevHash, map[int][]blkchain.Uint256{child.height: []blkchain.Uint256{child.bh.Hash()}})
+			}
 		}
 	}
+	return foundHeight
 }
 
-func ReadBtcnodeBlockHeaderIndex(addr string, tmout time.Duration, height int, hashes []blkchain.Uint256) (blkchain.BlockHeaderIndex, error) {
+func ReadBtcnodeBlockHeaderIndex(addr string, tmout time.Duration, hashes map[int][]blkchain.Uint256) (blkchain.BlockHeaderIndex, error) {
 
 	node, err := ConnectToNode(addr, tmout)
 	if err != nil {
@@ -250,7 +271,7 @@ func ReadBtcnodeBlockHeaderIndex(addr string, tmout time.Duration, height int, h
 	}
 
 	// Get headers
-	if err := node.getHeaders(hashes, height); err != nil {
+	if err := node.getHeaders(hashes); err != nil {
 		return nil, err
 	}
 

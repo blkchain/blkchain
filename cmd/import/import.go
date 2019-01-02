@@ -122,13 +122,13 @@ func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cache
 
 func btcNodeCatchUp(writer *db.PGWriter, addr string, tmout time.Duration, cacheSize int, interrupt chan bool) (int, error) {
 
-	lastHeight, lastHashes, err := writer.HeightAndHashes()
+	lastHashes, err := writer.HeightAndHashes(5)
 	if err != nil {
 		return 0, err
 	}
 
 	log.Printf("Reading block headers from Node (%s)...", addr)
-	bhs, err := btcnode.ReadBtcnodeBlockHeaderIndex(addr, tmout, lastHeight, lastHashes)
+	bhs, err := btcnode.ReadBtcnodeBlockHeaderIndex(addr, tmout, lastHashes)
 	if err != nil {
 		return 0, err
 	}
@@ -208,6 +208,9 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 
 func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int) {
 
+	// TODO: This code won't deal with splits very well, but at this
+	// stage of the DB population it is very unlikely to happen anyway.
+
 	utxo, err := coredb.NewChainStateChecker(chainStatePath)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
@@ -219,9 +222,14 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 		log.Fatalf("ERROR: %v", err)
 	}
 
-	lastHeight, _, err := writer.HeightAndHashes()
+	lastHashes, err := writer.HeightAndHashes(1)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
+	}
+
+	var lastHeight int
+	for lh, _ := range lastHashes {
+		lastHeight = lh
 	}
 
 	var startHeight int

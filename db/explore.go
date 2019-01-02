@@ -91,7 +91,6 @@ func (e *Explorer) SelectTxsJson(blockHash blkchain.Uint256, startN, limit int) 
 func (e *Explorer) SelectTxByHashJson(hash blkchain.Uint256) (*string, error) {
 	// This statement uses a bit of cleverness to hide the internal
 	// db ids, not sure if it was necessary.
-
 	stmt := `
 SELECT to_json(t.*) FROM (
 SELECT txid
@@ -137,4 +136,106 @@ func (e *Explorer) SelectHashType(hash blkchain.Uint256) (*string, error) {
 	}
 
 	return typ, nil
+}
+
+func (e *Explorer) SelectTxsByAddrJson(addr []byte, startTxId int, limit int) ([]string, error) {
+	// The first part of this query gets the tx ids we need by using
+	// the expression indexes on txins and txouts and orders them by
+	// tx_id. The second part adds the rest of the transaction
+	// data. Even though this seems like a lot, the heavylifting is
+	// done by the first part, after that all the tuples we need are
+	// already in memory.
+	stmt := `
+SELECT to_json(txs.*) FROM (
+SELECT t.id, t.txid, t.version, t.inputs, t.outputs, t.locktime FROM (
+  ( SELECT tx_id
+      FROM txins i
+     WHERE addr_prefix(scriptsig, witness) = bytes2int8($1)
+       AND prevout_tx_id IS NOT NULL
+       AND extract_address(scriptsig, witness) = $1
+       AND i.tx_id < $2
+     ORDER BY tx_id DESC
+    LIMIT $3
+  )
+  UNION
+  ( SELECT tx_id
+      FROM txouts o
+     WHERE addr_prefix(scriptpubkey) = bytes2int8($1)
+       AND extract_address(scriptpubkey) = $1
+       AND o.tx_id < $2
+     ORDER BY tx_id DESC
+    LIMIT $3
+  )
+ORDER BY tx_id DESC
+LIMIT $3
+) tid
+JOIN LATERAL (
+  SELECT id, txid, t.version, i.ins AS inputs, o.outs AS outputs, t.locktime
+  FROM txs t
+  JOIN LATERAL (
+    SELECT ARRAY_AGG(i.*  ORDER BY n) AS ins
+      FROM (
+        SELECT n, ts.txid AS prevout_hash, prevout_n, scriptsig, sequence, witness
+          FROM txins ti
+          JOIN txs ts ON ti.prevout_tx_id = ts.id
+         WHERE tx_id = t.id
+      ) i
+  ) i ON true
+  JOIN LATERAL (
+    SELECT ARRAY_AGG(o.*  ORDER BY n) AS outs
+      FROM (
+        SELECT n, value, scriptpubkey, spent
+          FROM txouts
+         WHERE tx_id = t.id
+      ) o
+  ) o ON true
+  WHERE t.id = tid.tx_id
+  ) t ON true
+) txs;
+`
+	var txs []string
+	if err := e.db.Select(&txs, stmt, addr, startTxId, limit); err != nil {
+		return nil, err
+	}
+
+	return txs, nil
+}
+
+func (e *Explorer) SelectAddrTotalReceived(addr []byte, limit int) (int64, error) {
+	// This query adds all the txouts to the given address, but
+	// subtracts the value that a corresponding txin had iff it was
+	// from the same address (unless the difference is negative). This
+	// query cannot work for address associated with a lot of txouts,
+	// so if the limit is hit, the method returns -1 meaning "too many
+	// txouts to count".
+	stmt := `
+SELECT SUM(recv) AS recv, COUNT(1) AS cnt FROM (
+  SELECT tx_id, o.n, CASE WHEN (o.value - self) < 0 THEN 0 ELSE (o.value-self) END AS recv
+      FROM txouts o
+      JOIN LATERAL (
+        SELECT COALESCE(SUM(oo.value), 0) AS self
+          FROM txins i
+          JOIN txouts oo ON i.prevout_tx_id = oo.tx_id AND i.prevout_n = oo.n
+        WHERE i.tx_id = o.tx_id
+          AND extract_address(scriptsig, witness) = $1
+     ) x ON true
+     WHERE addr_prefix(scriptpubkey) = bytes2int8($1)
+       AND extract_address(scriptpubkey) = $1
+  LIMIT $2
+) x;
+`
+	type recvCnt struct {
+		Recv int64
+		Cnt  int
+	}
+	var recv recvCnt
+	if err := e.db.Get(&recv, stmt, addr, limit+1); err != nil {
+		return 0, err
+	}
+
+	if recv.Cnt > limit { // To many rows
+		return -1, nil
+	}
+
+	return recv.Recv, nil
 }

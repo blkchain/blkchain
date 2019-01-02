@@ -46,6 +46,10 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 		return nil, err
 	}
 
+	if err := createPgcrypto(db); err != nil {
+		return nil, err
+	}
+
 	firstImport := true // firstImport == first import
 	if err := createTables(db); err != nil {
 		if strings.Contains(err.Error(), "already exists") {
@@ -100,18 +104,13 @@ func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) {
 	}
 }
 
-func (w *PGWriter) HeightAndHashes() (int, []blkchain.Uint256, error) {
-	return getHeightAndHashes(w.db)
+func (w *PGWriter) HeightAndHashes(back int) (map[int][]blkchain.Uint256, error) {
+	return getHeightAndHashes(w.db, back)
 }
 
 func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, firstImport bool, cacheSize int, utxo isUTXOer) {
 	defer wg.Done()
 
-	_, hashes, err := getHeightAndHashes(w.db)
-	if err != nil {
-		log.Printf("Error getting last hash and height, exiting: %v", err)
-		return
-	}
 	bid, err := getLastBlockId(w.db)
 	if err != nil {
 		log.Printf("Error getting last block id, exiting: %v", err)
@@ -137,16 +136,23 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 
 	writerWg.Add(4)
 
-	start := time.Now()
+	hashes, err := getHeightAndHashes(w.db, 1)
+	if err != nil {
+		log.Printf("Error getting last hash and height, exiting: %v", err)
+		return
+	}
 
 	// nil utxo means this is coming from a btcnode, we do not need to skip blocks
 	if utxo != nil && len(hashes) > 0 {
-		bhash := hashes[len(hashes)-1] // last hash in the list is the last hash
+		var bhash blkchain.Uint256
+		for _, hh := range hashes {
+			bhash = hh[len(hh)-1] // last hash in the list is the last hash
+		}
 		log.Printf("PGWriter ignoring blocks up to hash %v", bhash)
 		skip, last := 0, time.Now()
 		for b := range ch {
 			hash := b.Block.Hash()
-			if bytes.Compare(bhash[:], hash[:]) == 0 {
+			if bhash == hash {
 				break
 			} else {
 				skip++
@@ -169,9 +175,18 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		// exist, and we need to wait for a tx to be commited before
 		// ins/outs can be inserted. Same with block/tx.
 		syncCh = make(chan bool)
+
+		// The cache must be warmed up in (a rare) case when we encounter a chain split
+		// soon after we start to avoid duplicate txid key errors
+		nBlocks := 6
+		log.Printf("Warming up the txid cache going back %d blocks...", nBlocks)
+		if err := warmupCache(w.db, idCache, nBlocks); err != nil {
+			log.Printf("Error warming up the idCache: %v", err)
+		}
+		log.Printf("Warming up the cache done.")
 	}
 
-	txcnt, last := 0, time.Now()
+	txcnt, start, last := 0, time.Now(), time.Now()
 	blkCnt, blkSz := 0, 0
 	for br := range ch {
 		bid++
@@ -182,15 +197,18 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 
 		if br.Height < 0 { // We have to look it up
 
-			height, hashes, err := getHeightAndHashes(w.db)
+			hashes, err := getHeightAndHashes(w.db, 5)
 			if err != nil {
 				log.Printf("pgBlockWorker() error: %v", err)
 			}
 
-			for _, h := range hashes {
-				if h == br.PrevHash {
-					br.Height = height + 1
-					break
+		hloop:
+			for height, hh := range hashes {
+				for _, h := range hh {
+					if h == br.PrevHash {
+						br.Height = height + 1
+						break hloop
+					}
 				}
 			}
 
@@ -278,7 +296,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 					br.sync <- true
 				}
 			} else {
-				// we con't care when it finishes
+				// we don't care when it finishes
 				txInCh <- nil
 			}
 		} else if bid%30 == 0 {
@@ -469,6 +487,7 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 		}
 
 		if !tr.dupe {
+
 			t := tr.tx
 			_, err = stmt.Exec(
 				tr.id,
@@ -484,8 +503,7 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 				log.Printf("ERROR (7): %v", err)
 			}
 			// It can still be a dupe if we are catching up and the
-			// cache is empty. In which case we will get a Tx commit
-			// error below, which is fine.
+			// cache is empty, which is why we warmupCache.
 		}
 
 		_, err = bstmt.Exec(
@@ -499,14 +517,15 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 	}
 
 	log.Printf("Tx writer channel closed, committing transaction.")
+
 	if err = commit(stmt, txn, nil); err != nil {
 		log.Printf("Tx commit error: %v", err)
 	}
 	if err = commit(bstmt, btxn, nil); err != nil {
 		log.Printf("Block Txs commit error: %v", err)
 	}
-	log.Printf("Tx writer done.")
 
+	log.Printf("Tx writer done.")
 }
 
 func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
@@ -681,36 +700,37 @@ func commit(stmt *sql.Stmt, txn *sql.Tx, misses []*prevoutMiss) (err error) {
 	return nil
 }
 
-func getHeightAndHashes(db *sql.DB) (int, []blkchain.Uint256, error) {
+func getHeightAndHashes(db *sql.DB, back int) (map[int][]blkchain.Uint256, error) {
 
-	stmt := "SELECT height, hash FROM blocks " +
-		"WHERE height IN (SELECT MAX(height) FROM blocks) " +
-		"ORDER BY id "
+	stmt := `SELECT height, hash FROM blocks
+		WHERE height > (SELECT MAX(height) FROM blocks) - $1`
 
-	rows, err := db.Query(stmt)
+	rows, err := db.Query(stmt, back)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	defer rows.Close()
 
-	var (
-		height int
-		hashes = make([]blkchain.Uint256, 0, 1)
-	)
+	hashes := make(map[int][]blkchain.Uint256)
 
 	for rows.Next() {
-		var hash []byte
+		var (
+			height int
+			hash   blkchain.Uint256
+		)
 		if err := rows.Scan(&height, &hash); err != nil {
-			return 0, nil, err
+			return nil, err
 		}
-		hashes = append(hashes, blkchain.Uint256FromBytes(hash))
+		if list, ok := hashes[height]; ok {
+			hashes[height] = append(list, hash)
+		} else {
+			hashes[height] = []blkchain.Uint256{hash}
+		}
 	}
 	if len(hashes) > 0 {
-		return height, hashes, nil
+		return hashes, nil
 	}
-
-	// Initial height is -1, so that 1st block is height 0
-	return -1, nil, rows.Err()
+	return nil, rows.Err()
 }
 
 func getLastBlockId(db *sql.DB) (int, error) {
@@ -871,7 +891,7 @@ func createTables(db *sql.DB) error {
    tx_id         BIGINT NOT NULL
   ,n             SMALLINT NOT NULL
   ,prevout_tx_id BIGINT   -- can be NULL for coinbase
-  ,prevout_n     INT NOT NULL
+  ,prevout_n     SMALLINT NOT NULL
   ,scriptsig     BYTEA NOT NULL
   ,sequence      INT NOT NULL
   ,witness       BYTEA
@@ -886,6 +906,11 @@ func createTables(db *sql.DB) error {
   );
 `
 	_, err := db.Exec(sqlTables)
+	return err
+}
+
+func createPgcrypto(db *sql.DB) error {
+	_, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto")
 	return err
 }
 
@@ -1038,17 +1063,117 @@ func createIndexes2(db *sql.DB, verbose bool) error {
            END;
            $$ LANGUAGE plpgsql IMMUTABLE;
 
-           CREATE OR REPLACE FUNCTION addr_prefix(scriptPubKey BYTEA) RETURNS BYTEA AS $$
+           -- Cast the first 8 bytes of a BYTEA as a BIGINT
+           CREATE OR REPLACE FUNCTION bytes2int8(bytes BYTEA) RETURNS BIGINT AS $$
            BEGIN
-             RETURN SUBSTR(extract_address(scriptPubKey), 1, 5);
+             RETURN SUBSTR(bytes::text, 2, 16)::bit(64)::bigint;
            END;
            $$ LANGUAGE plpgsql IMMUTABLE;
 
-           CREATE INDEX IF NOT EXISTS txouts_addr_prefix_idx ON txouts(addr_prefix(scriptpubkey));
+           -- Address prefix (txout)
+           CREATE OR REPLACE FUNCTION addr_prefix(scriptPubKey BYTEA) RETURNS BIGINT AS $$
+           BEGIN
+             RETURN bytes2int8(extract_address(scriptPubKey));
+           END;
+           $$ LANGUAGE plpgsql IMMUTABLE;
+
+           CREATE INDEX IF NOT EXISTS txouts_addr_prefix_tx_id_idx ON txouts(addr_prefix(scriptpubkey), tx_id);
        `); err != nil {
 		return err
 	}
 
+	if verbose {
+		log.Printf("  - txins address prefix index...")
+	}
+	if _, err := db.Exec(`
+        CREATE OR REPLACE FUNCTION parse_witness(witness BYTEA) RETURNS BYTEA[] AS $$
+        DECLARE
+          stack BYTEA[];
+          len INT;
+          pos INT = 1;
+          slen INT;
+        BEGIN
+          IF witness IS NULL OR witness = '' THEN
+            RETURN NULL;
+          END IF;
+          len = GET_BYTE(witness, 0); -- this is a varint, but whatever
+          WHILE len > 0 LOOP
+            slen = GET_BYTE(witness, pos);
+            IF slen = 253 THEN
+              slen = GET_BYTE(witness, pos+1) + GET_BYTE(witness, pos+2)*256;
+              pos = pos+2;
+              -- NB: There is a possibility of a 4-byte compact, but no transaction uses it
+            END IF;
+            stack = stack || SUBSTR(witness, pos+2, slen);
+            pos = pos + slen + 1;
+            len = len - 1;
+          END LOOP;
+          RETURN stack;
+        END;
+        $$ LANGUAGE plpgsql IMMUTABLE;
+
+        CREATE OR REPLACE FUNCTION extract_address(scriptsig BYTEA, witness BYTEA) RETURNS BYTEA AS $$
+        DECLARE
+          pub BYTEA;
+          sha BYTEA;
+          wits BYTEA[];
+          len INT;
+          pos INT;
+          op INT;
+        BEGIN
+          IF LENGTH(scriptsig) = 0 OR scriptsig IS NULL THEN     -- Native SegWit: P2WSH or P2WPKH
+            wits = parse_witness(witness);
+            pub = wits[array_length(wits, 1)];
+            sha = digest(pub, 'sha256');
+            IF ARRAY_LENGTH(wits, 1) = 2 AND LENGTH(pub) = 33 THEN       -- Most likely a P2WPKH
+              RETURN digest(sha, 'ripemd160');
+            ELSE       -- Most likely a P2WSH
+              RETURN sha;
+            END IF;
+          ELSE
+             len = GET_BYTE(scriptsig, 0);
+             IF len = LENGTH(scriptsig) - 1 THEN        -- Most likely a P2SH (or P2SH-P2W*)
+               RETURN digest(digest(SUBSTR(scriptsig, 2), 'sha256'), 'ripemd160');
+             ELSE  -- P2PKH or longer P2SH, either way the last thing is what we need
+               pos = 0;
+               WHILE pos < LENGTH(scriptsig)-1 LOOP
+                 op = GET_BYTE(scriptsig, pos);
+                 IF op > 0 AND op < 76 THEN
+                   len = op;
+                   pos = pos + 1;
+                 ELSEIF op = 76 THEN
+                   len = GET_BYTE(scriptsig, pos+1);
+                   pos = pos + 2;
+                 ELSEIF op = 77 THEN
+                   len = GET_BYTE(scriptsig, pos+1) + GET_BYTE(scriptsig, pos+2)*256;
+                   pos = pos + 3;
+                 ELSE
+                   pos = pos + 1;
+                   CONTINUE;
+                 END IF;
+                 pub = SUBSTR(scriptsig, pos+1, len);
+                 pos = pos + len;
+               END LOOP;
+               RETURN digest(digest(pub, 'sha256'), 'ripemd160');
+             END IF;
+          END IF;
+          RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql IMMUTABLE;
+
+        -- Address prefix (txin)
+        CREATE OR REPLACE FUNCTION addr_prefix(scriptsig BYTEA, witness BYTEA) RETURNS BIGINT AS $$
+        BEGIN
+          RETURN bytes2int8(extract_address(scriptsig, witness));
+        END;
+        $$ LANGUAGE plpgsql IMMUTABLE;
+
+        -- Partial/conditional index because coinbase txin scriptsigs are garbage
+        CREATE INDEX IF NOT EXISTS txins_addr_prefix_tx_id_idx ON txins(addr_prefix(scriptsig, witness), tx_id)
+         WHERE prevout_tx_id IS NOT NULL;
+       `); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1214,6 +1339,42 @@ AFTER INSERT OR UPDATE OR DELETE ON txins DEFERRABLE
 
         `); err != nil {
 		return err
+	}
+	return nil
+}
+
+func warmupCache(db *sql.DB, cache *txIdCache, blocks int) error {
+	stmt := `
+SELECT t.id, t.txid, o.cnt
+  FROM txs t
+  JOIN LATERAL (
+    SELECT COUNT(1) AS cnt
+      FROM txouts o
+      WHERE o.tx_id = t.id
+ ) o ON true
+ WHERE id > (
+    SELECT MIN(tx_id) FROM block_txs bt
+      JOIN (
+        SELECT id FROM blocks ORDER BY id DESC LIMIT $1
+      ) b ON b.id = bt.block_id
+    )
+ORDER BY t.id;
+`
+	rows, err := db.Query(stmt, blocks)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var (
+		txid int64
+		hash blkchain.Uint256
+		cnt  int
+	)
+	for rows.Next() {
+		if err := rows.Scan(&txid, &hash, &cnt); err != nil {
+			return err
+		}
+		cache.add(hash, txid, cnt)
 	}
 	return nil
 }
