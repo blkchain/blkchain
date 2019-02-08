@@ -1,6 +1,8 @@
 package db
 
 import (
+	"fmt"
+
 	"github.com/blkchain/blkchain"
 	"github.com/jmoiron/sqlx"
 )
@@ -68,6 +70,10 @@ func (e *Explorer) SelectBlockByHashJson(hash blkchain.Uint256) (*string, error)
 }
 
 func (e *Explorer) SelectTxsJson(blockHash blkchain.Uint256, startN, limit int) ([]string, error) {
+	// NB: unlike with SelectTxByHashJson, we do not support negative
+	// limit here. This is because the block url structure in order to
+	// be cacheable is such that there is only one way to denote a
+	// section of a block (with positive limit).
 	stmt := `SELECT to_json(t.*) AS tx
   FROM (
     SELECT bt.n, t.txid, t.version, t.locktime
@@ -98,6 +104,7 @@ SELECT txid
        , i.ins AS inputs
        , o.outs AS outputs
        , t.locktime
+       , blocks
   FROM txs t
   JOIN LATERAL (
     SELECT ARRAY_AGG(i.*  ORDER BY n) AS ins
@@ -116,6 +123,12 @@ SELECT txid
          WHERE tx_id = t.id
       ) o
   ) o ON true
+  JOIN block_txs bt ON t.id = bt.tx_id
+  JOIN LATERAL (
+    SELECT ARRAY_AGG(hash) AS blocks
+      FROM blocks b
+     WHERE b.id = bt.block_id
+  ) b ON true
 WHERE t.txid = $1
 ) t;
 `
@@ -139,22 +152,31 @@ func (e *Explorer) SelectHashType(hash blkchain.Uint256) (*string, error) {
 }
 
 func (e *Explorer) SelectTxsByAddrJson(addr []byte, startTxId int, limit int) ([]string, error) {
+	// Negative limit changes the direction and the condition. (Though
+	// in the end rows are ordered DESC). The operator is exclusive
+	// (not >= or <=), so the start tx id is never in the result set.
+	//
 	// The first part of this query gets the tx ids we need by using
 	// the expression indexes on txins and txouts and orders them by
 	// tx_id. The second part adds the rest of the transaction
 	// data. Even though this seems like a lot, the heavylifting is
 	// done by the first part, after that all the tuples we need are
 	// already in memory.
-	stmt := `
+
+	operator, order := "<", "DESC"
+	if limit < 0 {
+		operator, limit, order = ">", -limit, "ASC"
+	}
+	stmt := fmt.Sprintf(`
 SELECT to_json(txs.*) FROM (
-SELECT t.id, t.txid, t.version, t.inputs, t.outputs, t.locktime FROM (
+SELECT t.id, t.txid, t.version, t.inputs, t.outputs, t.locktime, t.blocks FROM (
   ( SELECT tx_id
       FROM txins i
      WHERE addr_prefix(scriptsig, witness) = bytes2int8($1)
        AND prevout_tx_id IS NOT NULL
        AND extract_address(scriptsig, witness) = $1
-       AND i.tx_id < $2
-     ORDER BY tx_id DESC
+       AND i.tx_id %[1]s $2
+     ORDER BY tx_id %[2]s
     LIMIT $3
   )
   UNION
@@ -162,15 +184,15 @@ SELECT t.id, t.txid, t.version, t.inputs, t.outputs, t.locktime FROM (
       FROM txouts o
      WHERE addr_prefix(scriptpubkey) = bytes2int8($1)
        AND extract_address(scriptpubkey) = $1
-       AND o.tx_id < $2
-     ORDER BY tx_id DESC
+       AND o.tx_id %[1]s $2
+     ORDER BY tx_id %[2]s
     LIMIT $3
   )
-ORDER BY tx_id DESC
+ORDER BY tx_id %[2]s
 LIMIT $3
 ) tid
 JOIN LATERAL (
-  SELECT id, txid, t.version, i.ins AS inputs, o.outs AS outputs, t.locktime
+  SELECT id, txid, t.version, i.ins AS inputs, o.outs AS outputs, t.locktime, b.blocks
   FROM txs t
   JOIN LATERAL (
     SELECT ARRAY_AGG(i.*  ORDER BY n) AS ins
@@ -189,10 +211,17 @@ JOIN LATERAL (
          WHERE tx_id = t.id
       ) o
   ) o ON true
+  JOIN block_txs bt ON t.id = bt.tx_id
+  JOIN LATERAL (
+    SELECT ARRAY_AGG(hash) AS blocks
+      FROM blocks b
+     WHERE b.id = bt.block_id
+  ) b ON true
   WHERE t.id = tid.tx_id
   ) t ON true
+  ORDER BY tx_id DESC -- correct
 ) txs;
-`
+`, operator, order)
 	var txs []string
 	if err := e.db.Select(&txs, stmt, addr, startTxId, limit); err != nil {
 		return nil, err

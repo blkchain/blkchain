@@ -4,7 +4,8 @@
 ## Introduction
 
 This is Go code loosely aimed at importing the blockchain into
-Postgres as fast as possible.
+Postgres as fast as possible. Licensed under the Apache License,
+Version 2.0
 
 This is work-in-progress and is subject to a lot of changes. Postgres
 import was our first goal and as part of it much blockchain-specific
