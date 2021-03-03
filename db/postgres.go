@@ -91,7 +91,7 @@ func (p *PGWriter) Close() {
 	p.wg.Wait()
 }
 
-func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) {
+func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) error {
 	bs := &blockRecSync{BlockRec: b}
 	if sync {
 		bs.sync = make(chan bool)
@@ -100,8 +100,10 @@ func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) {
 	if sync {
 		if ok := <-bs.sync; !ok {
 			log.Printf("Error writing block: %v", b.Block.Hash())
+			return fmt.Errorf("Error writing block: %v", b.Block.Hash())
 		}
 	}
+	return nil
 }
 
 func (w *PGWriter) HeightAndHashes(back int) (map[int][]blkchain.Uint256, error) {

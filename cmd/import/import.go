@@ -160,6 +160,8 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 
 	var blkChWg sync.WaitGroup
 
+	aside := make([]*blkchain.Block, 0)
+
 	go func() {
 		blkChWg.Add(1)
 		defer blkChWg.Done()
@@ -171,8 +173,26 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 			}
 
 			log.Printf("Writing block %v...", blk.Hash())
-			writer.WriteBlock(br, true)
+			if err := writer.WriteBlock(br, true); err != nil {
+				aside = append(aside, blk)
+				log.Printf("Write failed - setting block %v aside (aside len: %d).", blk.Hash(), len(aside))
+				continue
+			}
 			log.Printf("Done writing block %v.", blk.Hash())
+
+			// Try writing out-of-order (aside) blocks
+			for len(aside) > 0 {
+				var asideBlk *blkchain.Block
+				asideBlk, aside = aside[0], aside[1:]
+
+				log.Printf("Writing (aside) block %v...", asideBlk.Hash())
+				if err := writer.WriteBlock(br, true); err != nil {
+					aside = append(aside, blk)
+					log.Printf("Write failed - setting (aside) block %v aside (aside len: %d).", blk.Hash(), len(aside))
+					continue
+				}
+				log.Printf("Done writing block %v.", blk.Hash())
+			}
 
 			go func() {
 				log.Printf("Marking orphan blocks going back 10...")
