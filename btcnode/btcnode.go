@@ -372,10 +372,11 @@ func (b *btcNode) WaitForBlock(interrupt chan bool) ([]*blkchain.Block, error) {
 		result := make([]*blkchain.Block, 0)
 		for _, inv := range msg.InvList {
 
+			hash := blkchain.Uint256(inv.Hash)
+
 			if inv.Type == wire.InvTypeBlock || inv.Type == wire.InvTypeWitnessBlock {
 				// NB: Seems like it's always InvTypeBlock, never InvTypeWitnessBlock.
 
-				hash := blkchain.Uint256(inv.Hash)
 				blk, err := b.getBlock(hash)
 
 				if err != nil {
@@ -383,6 +384,8 @@ func (b *btcNode) WaitForBlock(interrupt chan bool) ([]*blkchain.Block, error) {
 				}
 
 				result = append(result, blk)
+			} else {
+				log.Printf("WARNING: Unknown inv.Type %v for hash %v", inv.Type, hash)
 			}
 		}
 		if len(result) > 0 {

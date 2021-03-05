@@ -93,26 +93,40 @@ func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cache
 		return
 	}
 
-	for {
-		count, err := btcNodeCatchUp(writer, addr, tmout, cacheSize, interrupt)
-		if err != nil {
-			log.Printf("Error catching up from btc node: %v", err)
-			return
+outer:
+	for len(interrupt) == 0 {
+
+		for {
+			count, err := btcNodeCatchUp(writer, addr, tmout, cacheSize, interrupt)
+			if err != nil {
+				log.Printf("Error catching up from btc node: %v", err)
+				return
+			}
+
+			if len(interrupt) > 0 {
+				break outer
+			}
+
+			if count == 0 {
+				log.Printf("Node has no more new headers, catch up done.")
+				if wait {
+					break
+				}
+				break outer // nothing else to do
+			}
+
 		}
 
-		if len(interrupt) > 0 {
-			break
+		if wait && len(interrupt) == 0 {
+			// Error on processEachNewBlock only happens if a block
+			// cannot be connected, which means a block got skipped,
+			// which apparently happens. (TODO why?) If this happens,
+			// then we need to go back to btcNodeCatchUp
+			if err := processEachNewBlock(writer, addr, tmout, interrupt); err != nil {
+				continue // this will jump back to btcNodeCatchUp
+			}
 		}
 
-		if count == 0 {
-			log.Printf("Node has no more new headers, catch up done.")
-			break
-		}
-
-	}
-
-	if wait && len(interrupt) == 0 {
-		processEachNewBlock(writer, addr, tmout, interrupt)
 	}
 
 	log.Printf("Closing channel, waiting for workers to finish...")
@@ -148,7 +162,7 @@ func btcNodeCatchUp(writer *db.PGWriter, addr string, tmout time.Duration, cache
 	return bhs.Count(), nil
 }
 
-func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, interrupt chan bool) {
+func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, interrupt chan bool) error {
 
 	log.Printf("Connecting to Node (%s)...", addr)
 	node, err := btcnode.ConnectToNode(addr, tmout)
@@ -159,8 +173,7 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 	blkCh := make(chan *blkchain.Block, 8)
 
 	var blkChWg sync.WaitGroup
-
-	aside := make([]*blkchain.Block, 0)
+	var exit bool
 
 	go func() {
 		blkChWg.Add(1)
@@ -174,25 +187,11 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 
 			log.Printf("Writing block %v...", blk.Hash())
 			if err := writer.WriteBlock(br, true); err != nil {
-				aside = append(aside, blk)
-				log.Printf("Write failed - setting block %v aside (aside len: %d).", blk.Hash(), len(aside))
-				continue
+				log.Printf("Write failed - exiting processEachNewBlock() (%v)", blk.Hash())
+				exit = true
+				return
 			}
 			log.Printf("Done writing block %v.", blk.Hash())
-
-			// Try writing out-of-order (aside) blocks
-			for len(aside) > 0 {
-				var asideBlk *blkchain.Block
-				asideBlk, aside = aside[0], aside[1:]
-
-				log.Printf("Writing (aside) block %v...", asideBlk.Hash())
-				if err := writer.WriteBlock(br, true); err != nil {
-					aside = append(aside, blk)
-					log.Printf("Write failed - setting (aside) block %v aside (aside len: %d).", blk.Hash(), len(aside))
-					continue
-				}
-				log.Printf("Done writing block %v.", blk.Hash())
-			}
 
 			go func() {
 				log.Printf("Marking orphan blocks going back 10...")
@@ -217,13 +216,18 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 			blkCh <- blk
 		}
 
-		if len(interrupt) > 0 {
+		if exit || len(interrupt) > 0 {
 			close(blkCh)
 			blkChWg.Wait()
 			break
 		}
 	}
+	if exit {
+		log.Printf("Exiting processEachNewBlock() on writing error, possibly inventory skipped a block.")
+		return fmt.Errorf("Write error")
+	}
 	log.Printf("Exiting processEachNewBlock().")
+	return nil
 }
 
 func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int) {
