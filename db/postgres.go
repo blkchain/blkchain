@@ -1318,7 +1318,7 @@ CREATE OR REPLACE FUNCTION txins_after_trigger_func() RETURNS TRIGGER AS $$
     IF (TG_OP = 'DELETE') THEN
       IF OLD.prevout_tx_id IS NOT NULL THEN
         UPDATE txouts SET spent = FALSE
-         WHERE tx_id = prevout_tx_id AND n = OLD.prevout_n;
+         WHERE tx_id = OLD.prevout_tx_id AND n = OLD.prevout_n;
       END IF;
       RETURN OLD;
     ELSIF (TG_OP = 'UPDATE' OR TG_OP = 'INSERT') THEN
