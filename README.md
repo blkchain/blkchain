@@ -125,7 +125,14 @@ the initial import because it does not have the luxury of not having
 indexes and constraints. The catch up does not read LevelDb, it simply
 uses the Bitcoin protocol to request new blocks from the node. If you
 specify the `-wait` option, the import will wait for new blocks as
-they are announced and write them to the DB.
+they are announced and write them to the DB. For example:
+
+``` sh
+# In this example there is a full node running on 192.168.1.224, new blocks will be written as they come in.
+./import \
+    -connstr "host=192.168.1.223 dbname=blocks sslmode=disable" \
+    -nodeaddr 192.168.1.224:8333 -wait
+```
 
 ## PostgreSQL Tuning
 
