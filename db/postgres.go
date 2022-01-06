@@ -340,22 +340,8 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	verbose := firstImport
 
 	if firstImport {
-		log.Printf("Creating indexes part 1 (if needed), please be patient, this may take a long time...")
-		if err := createIndexes1(w.db, verbose); err != nil {
-			log.Printf("Error creating indexes: %v", err)
-		}
-
-		if idCache.miss > 0 {
-			log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
-			if err := fixPrevoutTxId(w.db); err != nil {
-				log.Printf("Error fixing prevout_tx_id: %v", err)
-			}
-		} else {
-			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
-		}
-
-		log.Printf("Creating indexes part 2 (if needed), please be patient, this may take a long time...")
-		if err := createIndexes2(w.db, verbose); err != nil {
+		log.Printf("Creating indexes (if needed), please be patient, this may take a long time...")
+		if err := createIndexes(w.db, verbose); err != nil {
 			log.Printf("Error creating indexes: %v", err)
 		}
 
@@ -363,18 +349,30 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		if err := createConstraints(w.db, verbose); err != nil {
 			log.Printf("Error creating constraints: %v", err)
 		}
+
+		log.Printf("Creating txins triggers.")
+		if err := createTxinsTriggers(w.db); err != nil {
+			log.Printf("Error creating txins triggers: %v", err)
+		}
+
+		if idCache.miss > 0 {
+			log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
+			// NB: The ANALYZE below seems to make no difference when _prvout_miss is relatively small
+			// log.Printf("  running ANALYZE txins, _prevout_miss, txs to ensure the next step selects the optimal plan...")
+			// if err := fixPrevoutTxIdAnalyze(w.db); err != nil {
+			// 	log.Printf("Error running ANALYZE: %v", err)
+			// }
+			if err := fixPrevoutTxId(w.db); err != nil {
+				log.Printf("Error fixing prevout_tx_id: %v", err)
+			}
+		} else {
+			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
+		}
 	}
 
 	log.Printf("Dropping _prevout_miss table.")
 	if err := dropPrevoutMissTable(w.db); err != nil {
 		log.Printf("Error dropping _prevout_miss table: %v", err)
-	}
-
-	if firstImport {
-		log.Printf("Creating txins triggers.")
-		if err := createTxinsTriggers(w.db); err != nil {
-			log.Printf("Error creating txins triggers: %v", err)
-		}
 	}
 
 	orphanLimit := 0
@@ -853,6 +851,11 @@ func fixPrevoutTxId(db execer) error {
 	return clearPrevoutMissTable(db)
 }
 
+// func fixPrevoutTxIdAnalyze(db execer) error {
+// 	_, err := db.Exec(`ANALYZE txins, _prevout_miss, txs`)
+// 	return err
+// }
+
 func createTables(db *sql.DB) error {
 	sqlTables := `
   CREATE TABLE blocks (
@@ -916,7 +919,7 @@ func createPgcrypto(db *sql.DB) error {
 	return err
 }
 
-func createIndexes1(db *sql.DB, verbose bool) error {
+func createIndexes(db *sql.DB, verbose bool) error {
 	// Adding a constraint or index if it does not exist is a little tricky in PG
 	if verbose {
 		log.Printf("  - blocks primary key...")
@@ -1004,13 +1007,9 @@ func createIndexes1(db *sql.DB, verbose bool) error {
          RETURN NULL;
        END;
        $$ LANGUAGE plpgsql;
-       `); err != nil {
+    `); err != nil {
 		return err
 	}
-	return nil
-}
-
-func createIndexes2(db *sql.DB, verbose bool) error {
 	if verbose {
 		log.Printf("  - txins (prevout_tx_id, prevout_tx_n) index...")
 	}
@@ -1045,7 +1044,6 @@ func createIndexes2(db *sql.DB, verbose bool) error {
        $$;`); err != nil {
 		return err
 	}
-
 	if verbose {
 		log.Printf("  - txouts address prefix index...")
 	}
@@ -1083,7 +1081,6 @@ func createIndexes2(db *sql.DB, verbose bool) error {
        `); err != nil {
 		return err
 	}
-
 	if verbose {
 		log.Printf("  - txins address prefix index...")
 	}
@@ -1243,8 +1240,6 @@ func createConstraints(db *sql.DB, verbose bool) error {
 	return nil
 }
 
-// TODO: We already take care of this in leveldb.go?
-//
 // Set the orphan status starting from the highest block and going
 // backwards, up to limit. If limit is 0, the whole table is updated.
 //
