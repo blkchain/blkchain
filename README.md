@@ -113,10 +113,11 @@ otherwise tying up loose ends.
 The `-cache-size` parameter is the cache of txid (the SHA256) to the
 database tx_id, which import can set on the fly. This cache is also
 used to identify duplicate transactions. Having a cache of 30M
-(default) entries achieves 100% hit rate. The missing ids will be
-corrected later, but having as much as possible set from the beginning
-will reduce the time it takes to correct them later. A 30M entry cache
-will result in the import process taking up ~3GB of RAM.
+(default) entries achieves 98.39% hit rate (as of Jan 2022, see
+above). The missing ids will be corrected later, but having as much as
+possible set from the beginning will reduce the time it takes to
+correct them later. A 30M entry cache will result in the import
+process taking up ~3GB of RAM.
 
 After the initial import, the tool can "catch up" by importing new
 blocks not yet in the database. The catch up is many times slower than
