@@ -1121,18 +1121,18 @@ func createIndexes(db *sql.DB, verbose bool) error {
           op INT;
         BEGIN
           IF LENGTH(scriptsig) = 0 OR scriptsig IS NULL THEN     -- Native SegWit: P2WSH or P2WPKH
-            wits = parse_witness(witness);
+            wits = public.parse_witness(witness);
             pub = wits[array_length(wits, 1)];
-            sha = digest(pub, 'sha256');
+            sha = public.digest(pub, 'sha256');
             IF ARRAY_LENGTH(wits, 1) = 2 AND LENGTH(pub) = 33 THEN       -- Most likely a P2WPKH
-              RETURN digest(sha, 'ripemd160');
+              RETURN public.digest(sha, 'ripemd160');
             ELSE       -- Most likely a P2WSH
               RETURN sha;
             END IF;
           ELSE
              len = GET_BYTE(scriptsig, 0);
              IF len = LENGTH(scriptsig) - 1 THEN        -- Most likely a P2SH (or P2SH-P2W*)
-               RETURN digest(digest(SUBSTR(scriptsig, 2), 'sha256'), 'ripemd160');
+               RETURN public.digest(public.digest(SUBSTR(scriptsig, 2), 'sha256'), 'ripemd160');
              ELSE  -- P2PKH or longer P2SH, either way the last thing is what we need
                pos = 0;
                WHILE pos < LENGTH(scriptsig)-1 LOOP
@@ -1153,7 +1153,7 @@ func createIndexes(db *sql.DB, verbose bool) error {
                  pub = SUBSTR(scriptsig, pos+1, len);
                  pos = pos + len;
                END LOOP;
-               RETURN digest(digest(pub, 'sha256'), 'ripemd160');
+               RETURN public.digest(public.digest(pub, 'sha256'), 'ripemd160');
              END IF;
           END IF;
           RETURN NULL;
@@ -1163,7 +1163,7 @@ func createIndexes(db *sql.DB, verbose bool) error {
         -- Address prefix (txin)
         CREATE OR REPLACE FUNCTION addr_prefix(scriptsig BYTEA, witness BYTEA) RETURNS BIGINT AS $$
         BEGIN
-          RETURN bytes2int8(extract_address(scriptsig, witness));
+          RETURN public.bytes2int8(public.extract_address(scriptsig, witness));
         END;
         $$ LANGUAGE plpgsql IMMUTABLE;
 
