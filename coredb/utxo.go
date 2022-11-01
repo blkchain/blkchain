@@ -4,7 +4,7 @@ import (
 	"io"
 
 	"github.com/blkchain/blkchain"
-	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 type UTXO struct {
@@ -155,7 +155,7 @@ func decompressScript(size int, in []byte) []byte {
 		cKey := make([]byte, 33)
 		cKey[0] = byte(size) - 2
 		copy(cKey[1:], in)
-		key, err := btcec.ParsePubKey(cKey, btcec.S256())
+		key, err := btcec.ParsePubKey(cKey)
 		if err != nil {
 			return nil
 		}
