@@ -15,14 +15,17 @@ import (
 // the entry when the count reaches 0. This is far from perfect,
 // because (1) there can be duplicate spending transactions coming
 // from orphaned blocks (which will use up the counter on the first
-// hit and cause the entry to get purged) and (2) this cache is of
-// limited size and some misses are unavoidable. The idea is to do as
-// much as possible here, then correct all the discrepancies once it
-// is all in the database.
-type idOutCnt struct {
-	id  int64
-	cnt uint16
-}
+// hit and cause the entry to get purged - but this is adressed in the
+// "recent" cache below) and (2) this cache is of limited size and
+// some misses are unavoidable. The idea is to do as much as possible
+// here, then correct all the discrepancies once it is all in the
+// database.
+//
+// We cache a uint64, first 48 bits is id, remaining 16 bits is count
+// To create it: uint64((id << 16) | uint64(uint16(cnt)))
+// To get the id out of it: idcnt >> 16
+// To decrement the count: idcnt--
+// To get the count: idcnt&0xffff
 
 // Use only the first N bytes to save memory
 const HASH_PREFIX_SIZE = 10
@@ -31,7 +34,7 @@ const RECENT_RING_SIZE = 1024 * 64
 
 type txIdCache struct {
 	*sync.Mutex
-	m    map[[HASH_PREFIX_SIZE]byte]*idOutCnt
+	m    map[[HASH_PREFIX_SIZE]byte]*uint64
 	sz   int
 	cols int
 	dups int
@@ -58,7 +61,7 @@ func newTxIdCache(sz int) *txIdCache {
 	}
 	return &txIdCache{
 		Mutex:  new(sync.Mutex),
-		m:      make(map[[HASH_PREFIX_SIZE]byte]*idOutCnt, alloc),
+		m:      make(map[[HASH_PREFIX_SIZE]byte]*uint64, alloc),
 		sz:     sz,
 		recent: make(map[[HASH_PREFIX_SIZE]byte]int64, RECENT_RING_SIZE),
 		ring:   make([][HASH_PREFIX_SIZE]byte, RECENT_RING_SIZE),
@@ -134,9 +137,10 @@ func (c *txIdCache) add(hash blkchain.Uint256, id int64, cnt int) int64 {
 			// highly improbable.
 			c.cols++
 			log.Printf("WARNING: Txid possible cache collision at hash: %s", hash)
-			result = hit.id
+			result = int64(*hit >> 16)
 		} else {
-			c.m[key] = &idOutCnt{id, uint16(cnt)}
+			val := uint64(uint64(id<<16) | uint64(uint16(cnt)))
+			c.m[key] = &val
 			result = id
 		}
 		c.Unlock()
@@ -152,13 +156,14 @@ func (c *txIdCache) check(hash blkchain.Uint256) *int64 {
 	c.Lock()
 	if idcnt, ok := c.m[key]; ok {
 		c.hits++
-		idcnt.cnt--
-		if idcnt.cnt == 0 { // && !c.recent[key] {
+		*idcnt--
+		if (*idcnt)&0xffff == 0 { // && !c.recent[key] {
 			c.evic++
 			delete(c.m, key)
 		}
 		c.Unlock()
-		return &idcnt.id
+		result := int64(*idcnt >> 16)
+		return &result
 	}
 	c.miss++
 	c.Unlock()
