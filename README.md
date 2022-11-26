@@ -139,7 +139,7 @@ they are announced and write them to the DB. For example:
 * Using SSD's on the Postgres server (as well as the sending machine) will
   make this process go much faster. Remember to set `random_page_cost`
   to `1` or less, depending on how fast your disk really is. The
-  blockchain will occupy mode than 600GB on disk and this will grow as
+  blockchain will occupy more than 600GB on disk and this will grow as
   time goes on.
 
 * Turning off `synchronous_commit` and setting `commit_delay` to
@@ -161,6 +161,9 @@ they are announced and write them to the DB. For example:
   increasing `wal_buffers` and `wal_writer_flush_after` should speed
   up the initial import in theory.
 
+* Setting `wal_level` to `minimal` may help as well. (You will also
+  need to set `max_wal_senders` to 0 if you use `minimal`).
+
 ## ZFS
 
 Using a filesystem which supports snapshots is very useful for
@@ -171,12 +174,11 @@ ZFS (at least used on a single disk) seems slower than ext4, but still
 well worth it. The settings we ended up with are:
 
 ``` sh
-zfs set compression=lz4 tank/blocks
+zfs set compression=lz4 tank/blocks # zstd if your version supports it
 zfs set atime=off tank/blocks
 zfs set primarycache=all tank/blocks # yes, all, not metadata
 zfs set recordsize=16k tank/blocks
 zfs set logbias=throughput tank/blocks
-echo 1 > /sys/module/zfs/parameters/zfs_txg_timeout
 
 ```
 

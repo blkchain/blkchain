@@ -66,6 +66,10 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 			return nil, fmt.Errorf("First import must be done with UTXO checker, i.e. from LevelDb directly. (utxo == nil)")
 		}
 		log.Printf("Tables created without indexes, which are created at the very end.")
+		if err := setTableStorageParams(db); err != nil {
+			return nil, err
+		}
+		log.Printf("Disabled autovacuum/analyze for the initial import.")
 	}
 
 	if err := createPrevoutMissTable(db); err != nil {
@@ -188,7 +192,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		log.Printf("Warming up the cache done.")
 	}
 
-	txcnt, start, last := 0, time.Now(), time.Now()
+	txcnt, start, lastStatus, lastCacheStatus := 0, time.Now(), time.Now(), 0
 	blkCnt, blkSz := 0, 0
 	for br := range ch {
 		bid++
@@ -310,13 +314,18 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		}
 
 		// report progress
-		if time.Now().Sub(last) > 5*time.Second {
+		if time.Now().Sub(lastStatus) > 5*time.Second {
 			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f KB/s: %02f",
 				br.Height, txcnt,
 				time.Unix(int64(br.Time), 0),
 				float64(txcnt)/time.Now().Sub(start).Seconds(),
 				float64(blkSz/1024)/time.Now().Sub(start).Seconds())
-			last = time.Now()
+			lastStatus = time.Now()
+			lastCacheStatus++
+			if lastCacheStatus == 5 {
+				idCache.reportStats()
+				lastCacheStatus = 0
+			}
 		}
 	}
 
@@ -333,9 +342,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		return
 	}
 
-	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d dupes: %d evictions: %d",
-		idCache.hits, float64(idCache.hits)/(float64(idCache.hits+idCache.miss)+0.0001)*100,
-		idCache.miss, idCache.cols, idCache.dups, idCache.evic)
+	idCache.reportStats() // Final stats ane last time
 
 	verbose := firstImport
 
@@ -356,18 +363,21 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		}
 
 		if idCache.miss > 0 {
+			log.Printf("Running ANALYZE txins, _prevout_miss, txs to ensure the next step selects the optimal plan...")
+			if err := fixPrevoutTxIdAnalyze(w.db); err != nil {
+				log.Printf("Error running ANALYZE: %v", err)
+			}
 			log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
-			// NB: The ANALYZE below seems to make no difference when _prvout_miss is relatively small
-			// log.Printf("  running ANALYZE txins, _prevout_miss, txs to ensure the next step selects the optimal plan...")
-			// if err := fixPrevoutTxIdAnalyze(w.db); err != nil {
-			// 	log.Printf("Error running ANALYZE: %v", err)
-			// }
 			if err := fixPrevoutTxId(w.db); err != nil {
 				log.Printf("Error fixing prevout_tx_id: %v", err)
 			}
 		} else {
 			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
 		}
+		if err := resetTableStorageParams(w.db); err != nil {
+			log.Printf("Error resetting storage parameters: %v", err)
+		}
+		log.Printf("Autovacuum/analyze re-enabled.")
 	}
 
 	log.Printf("Dropping _prevout_miss table.")
@@ -851,10 +861,10 @@ func fixPrevoutTxId(db execer) error {
 	return clearPrevoutMissTable(db)
 }
 
-// func fixPrevoutTxIdAnalyze(db execer) error {
-// 	_, err := db.Exec(`ANALYZE txins, _prevout_miss, txs`)
-// 	return err
-// }
+func fixPrevoutTxIdAnalyze(db execer) error {
+	_, err := db.Exec(`ANALYZE txins, _prevout_miss, txs`)
+	return err
+}
 
 func createTables(db *sql.DB) error {
 	sqlTables := `
@@ -912,6 +922,26 @@ func createTables(db *sql.DB) error {
 `
 	_, err := db.Exec(sqlTables)
 	return err
+}
+
+func setTableStorageParams(db *sql.DB) error {
+	for _, table := range []string{"blocks", "txs", "block_txs", "txins", "txouts"} {
+		stmt := fmt.Sprintf(`ALTER TABLE %s SET (autovacuum_enabled=false)`, table)
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resetTableStorageParams(db *sql.DB) error {
+	for _, table := range []string{"blocks", "txs", "block_txs", "txins", "txouts"} {
+		stmt := fmt.Sprintf(`ALTER TABLE %s RESET (autovacuum_enabled)`, table)
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func createPgcrypto(db *sql.DB) error {

@@ -38,9 +38,14 @@ type txIdCache struct {
 	hits int
 	miss int
 	evic int
-	// The following is to not purge the N most recent
+	// The following "recent cache" is to not purge the N most recent
 	// transactions. This is necessary when we detect known
-	// transactions during chain splits.
+	// transactions during chain splits. (In other words these
+	// transactions stay in this small cache no matter what and are
+	// only evicted through aging). This is a small map, which is our
+	// cache, and a fixed size slice called ring through which we
+	// cycle and this is how we know when an entry is no longer recent
+	// and delete it from the recent map.
 	recent map[[HASH_PREFIX_SIZE]byte]int64
 	ring   [][HASH_PREFIX_SIZE]byte
 	ring_n int
@@ -76,15 +81,19 @@ func (c *txIdCache) addRing(key [HASH_PREFIX_SIZE]byte, id int64) int64 {
 		c.recent[key] = id
 	}
 
+	// Increment or cycle back to 0
 	c.ring_n++
 	if c.ring_n == RECENT_RING_SIZE {
 		c.ring_n = 0
 	}
 
+	// If the next entry is non-zero and there was no hit, delete it
+	// from the map because it is no longer recent
 	if c.ring[c.ring_n] != zeroHashPrefix && result == -1 {
 		delete(c.recent, c.ring[c.ring_n])
 	}
 
+	// And now put the new value in this next slot
 	c.ring[c.ring_n] = key
 
 	c.Unlock()
@@ -109,9 +118,12 @@ func (c *txIdCache) add(hash blkchain.Uint256, id int64, cnt int) int64 {
 	)
 	copy(key[:], hash[:HASH_PREFIX_SIZE])
 
-	if recent := c.addRing(key, id); recent != -1 { // true if this is a recent transaction
+	if recent := c.addRing(key, id); recent != -1 {
+		// If this transaction is in the recent ring, it means it has
+		// already been added to the big cache, so we forego adding.
 		result = recent
 	} else {
+		// Otherwise add it to the big cache
 		c.Lock()
 
 		c.checkSize()
@@ -151,4 +163,10 @@ func (c *txIdCache) check(hash blkchain.Uint256) *int64 {
 	c.miss++
 	c.Unlock()
 	return nil
+}
+
+func (c *txIdCache) reportStats() {
+	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d dupes: %d evictions: %d size: %d",
+		c.hits, float64(c.hits)/(float64(c.hits+c.miss)+0.0001)*100,
+		c.miss, c.cols, c.dups, c.evic, len(c.m))
 }
