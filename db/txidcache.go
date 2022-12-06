@@ -71,6 +71,10 @@ func newTxIdCache(sz int) *txIdCache {
 
 var zeroHashPrefix [HASH_PREFIX_SIZE]byte
 
+func (c *txIdCache) clear() {
+	c.m = make(map[[HASH_PREFIX_SIZE]byte]*uint64)
+}
+
 // Returns cached id if it is recent, otherwise -1
 func (c *txIdCache) addRing(key [HASH_PREFIX_SIZE]byte, id int64) int64 {
 	c.Lock()

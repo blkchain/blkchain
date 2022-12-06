@@ -28,6 +28,7 @@ func main() {
 	testNet := flag.Bool("testnet", false, "Use testnet magic")
 	cacheSize := flag.Int("cache-size", 30_000_000, "Tx hashes to cache for pervout_tx_id")
 	wait := flag.Bool("wait", false, "Keep on waiting for blocks from Bitcoin node")
+	zfsDataset := flag.String("zfs-dataset", "", "ZFS dataset to take snapshots of (empty = no snapshots)")
 
 	flag.Parse()
 
@@ -69,7 +70,7 @@ func main() {
 			log.Printf("Error setting rlimit: %v", err)
 			return
 		}
-		processEverythingLevelDb(*connStr, *blocksPath, *indexPath, *chainStatePath, magic, *cacheSize)
+		processEverythingLevelDb(*connStr, *blocksPath, *indexPath, *chainStatePath, magic, *cacheSize, *zfsDataset)
 	}
 
 }
@@ -87,7 +88,7 @@ func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cache
 		interrupt <- true
 	}()
 
-	writer, err := db.NewPGWriter(dbconnect, cacheSize, nil)
+	writer, err := db.NewPGWriter(dbconnect, cacheSize, nil, "")
 	if err != nil {
 		log.Printf("Error creating writer: %v", err)
 		return
@@ -131,7 +132,7 @@ outer:
 
 	log.Printf("Closing channel, waiting for workers to finish...")
 	writer.Close()
-	log.Printf("All done.")
+	log.Printf("All done in %s.", writer.Uptime().Round(time.Millisecond))
 }
 
 func btcNodeCatchUp(writer *db.PGWriter, addr string, tmout time.Duration, cacheSize int, interrupt chan bool) (int, error) {
@@ -230,7 +231,7 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 	return nil
 }
 
-func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int) {
+func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int, zfsDataset string) {
 
 	// TODO: This code won't deal with splits very well, but at this
 	// stage of the DB population it is very unlikely to happen anyway.
@@ -241,7 +242,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 	}
 	defer utxo.Close()
 
-	writer, err := db.NewPGWriter(dbconnect, cacheSize, utxo)
+	writer, err := db.NewPGWriter(dbconnect, cacheSize, utxo, zfsDataset)
 	if err != nil {
 		log.Fatalf("ERROR: %v", err)
 	}
@@ -294,7 +295,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 
 	log.Printf("Closing channel, waiting for workers to finish...")
 	writer.Close()
-	log.Printf("All done.")
+	log.Printf("All done in %s.", writer.Uptime().Round(time.Millisecond))
 }
 
 func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, sync bool, interrupt chan bool) error {

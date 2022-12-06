@@ -28,22 +28,32 @@ type blockRecSync struct {
 }
 
 type PGWriter struct {
-	blockCh chan *blockRecSync
-	wg      *sync.WaitGroup
-	db      *sql.DB
+	blockCh    chan *blockRecSync
+	wg         *sync.WaitGroup
+	db         *sql.DB
+	start      time.Time
+	zfsDataset string
 }
 
 type isUTXOer interface {
 	IsUTXO(blkchain.Uint256, uint32) (bool, error)
 }
 
-func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error) {
+func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer, zfsDataset string) (*PGWriter, error) {
+
+	start := time.Now()
 
 	var wg sync.WaitGroup
 
-	db, err := sql.Open("postgres", connstr)
-	if err != nil {
-		return nil, err
+	var db *sql.DB
+
+	if connstr == "nulldb" {
+		db, _ = sql.Open("nulldb", "")
+	} else {
+		var err error
+		if db, err = sql.Open("postgres", connstr); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := createPgcrypto(db); err != nil {
@@ -80,9 +90,11 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 	wg.Add(1)
 
 	w := &PGWriter{
-		blockCh: bch,
-		wg:      &wg,
-		db:      db,
+		blockCh:    bch,
+		wg:         &wg,
+		db:         db,
+		start:      start,
+		zfsDataset: zfsDataset,
 	}
 
 	go w.pgBlockWorker(bch, &wg, firstImport, cacheSize, utxo)
@@ -93,6 +105,10 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer) (*PGWriter, error
 func (p *PGWriter) Close() {
 	close(p.blockCh)
 	p.wg.Wait()
+}
+
+func (p *PGWriter) Uptime() time.Duration {
+	return time.Now().Sub(p.start)
 }
 
 func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) error {
@@ -192,7 +208,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		log.Printf("Warming up the cache done.")
 	}
 
-	txcnt, start, lastStatus, lastCacheStatus := 0, time.Now(), time.Now(), 0
+	txcnt, start, lastStatus, lastCacheStatus, lastHeight := 0, time.Now(), time.Now(), 0, -1
 	blkCnt, blkSz := 0, 0
 	for br := range ch {
 		bid++
@@ -226,6 +242,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 				continue
 			}
 		}
+		lastHeight = br.Height
 
 		blkSz += br.Size()
 		blockCh <- br
@@ -305,7 +322,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 				// we don't care when it finishes
 				txInCh <- nil
 			}
-		} else if bid%30 == 0 {
+		} else if bid%1024 == 0 {
 			// commit every N blocks
 			blockCh <- nil
 			txCh <- nil
@@ -315,11 +332,13 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 
 		// report progress
 		if time.Now().Sub(lastStatus) > 5*time.Second {
-			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f KB/s: %02f",
+			uptime := w.Uptime().Round(time.Second)
+			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f KB/s: %02f Uptime: %s",
 				br.Height, txcnt,
 				time.Unix(int64(br.Time), 0),
 				float64(txcnt)/time.Now().Sub(start).Seconds(),
-				float64(blkSz/1024)/time.Now().Sub(start).Seconds())
+				float64(blkSz/1024)/time.Now().Sub(start).Seconds(),
+				uptime)
 			lastStatus = time.Now()
 			lastCacheStatus++
 			if lastCacheStatus == 5 {
@@ -347,6 +366,13 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	verbose := firstImport
 
 	if firstImport {
+		idCache.clear()
+		log.Printf("Cleared the cache.")
+
+		if len(w.zfsDataset) > 0 {
+			takeSnapshot(w.db, w.zfsDataset, lastHeight, "-preindex")
+		}
+
 		log.Printf("Creating indexes (if needed), please be patient, this may take a long time...")
 		if err := createIndexes(w.db, verbose); err != nil {
 			log.Printf("Error creating indexes: %v", err)
@@ -357,23 +383,31 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 			log.Printf("Error creating constraints: %v", err)
 		}
 
+		if idCache.miss > 0 {
+			log.Printf("Running ANALYZE txins, _prevout_miss, txs to ensure the next step selects the optimal plan...")
+			start := time.Now()
+			if err := fixPrevoutTxIdAnalyze(w.db); err != nil {
+				log.Printf("Error running ANALYZE: %v", err)
+			}
+			log.Printf("...done in %s. Fixing missing prevout_tx_id entries (if needed), this may take a long time..",
+				time.Now().Sub(start).Round(time.Millisecond))
+			start = time.Now()
+			if err := fixPrevoutTxId(w.db); err != nil {
+				log.Printf("Error fixing prevout_tx_id: %v", err)
+			}
+			log.Printf("...done in %s.", time.Now().Sub(start).Round(time.Millisecond))
+		} else {
+			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
+		}
+
+		// NOTE: It is imperative that this trigger is created *after* the fixPrevoutTxId() call, or else these
+		// triggers will be needlessly triggered slowing fixPrevoutTxId() tremendously. The trigger sets the spent
+		// column, which should anyway be correctly set during the initial import based on the LevelDb UTXO set.
 		log.Printf("Creating txins triggers.")
 		if err := createTxinsTriggers(w.db); err != nil {
 			log.Printf("Error creating txins triggers: %v", err)
 		}
 
-		if idCache.miss > 0 {
-			log.Printf("Running ANALYZE txins, _prevout_miss, txs to ensure the next step selects the optimal plan...")
-			if err := fixPrevoutTxIdAnalyze(w.db); err != nil {
-				log.Printf("Error running ANALYZE: %v", err)
-			}
-			log.Printf("Fixing missing prevout_tx_id entries (if needed), this may take a long time...")
-			if err := fixPrevoutTxId(w.db); err != nil {
-				log.Printf("Error fixing prevout_tx_id: %v", err)
-			}
-		} else {
-			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
-		}
 		if err := resetTableStorageParams(w.db); err != nil {
 			log.Printf("Error resetting storage parameters: %v", err)
 		}
@@ -385,7 +419,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		log.Printf("Error dropping _prevout_miss table: %v", err)
 	}
 
-	orphanLimit := 0
+	orphanLimit, start := 0, time.Now()
 	if !firstImport {
 		// No need to walk back the entire chain
 		orphanLimit = blkCnt + 50
@@ -396,10 +430,13 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	if err := w.SetOrphans(orphanLimit); err != nil {
 		log.Printf("Error marking orphans: %v", err)
 	}
-	log.Printf("Done marking orphan blocks.")
+	log.Printf("Done marking orphan blocks in %s.", time.Now().Sub(start).Round(time.Millisecond))
 
 	if firstImport {
 		log.Printf("Indexes and constraints created.")
+		if len(w.zfsDataset) > 0 {
+			takeSnapshot(w.db, w.zfsDataset, lastHeight, "-postindex")
+		}
 	}
 }
 
@@ -717,7 +754,7 @@ func getHeightAndHashes(db *sql.DB, back int) (map[int][]blkchain.Uint256, error
 
 	rows, err := db.Query(stmt, back)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getHeightAndHashes: %v", err)
 	}
 	defer rows.Close()
 
@@ -950,10 +987,12 @@ func createPgcrypto(db *sql.DB) error {
 }
 
 func createIndexes(db *sql.DB, verbose bool) error {
+	var start time.Time
 	// Adding a constraint or index if it does not exist is a little tricky in PG
 	if verbose {
-		log.Printf("  - blocks primary key...")
+		log.Printf("  Starting blocks primary key...")
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        DO $$
        BEGIN
@@ -966,26 +1005,30 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - blocks prevhash index...")
+		log.Printf("  ...done in %s. Starting blocks prevhash index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS blocks_prevhash_idx ON blocks(prevhash);"); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - blocks hash index...")
+		log.Printf("  ...done in %s. Starting blocks hash index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS blocks_hash_idx ON blocks(hash);"); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - blocks height index...")
+		log.Printf("  ...done in %s. Starting blocks height index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS blocks_height_idx ON blocks(height);"); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txs primary key...")
+		log.Printf("  ...done in %s. Starting txs primary key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        DO $$
        BEGIN
@@ -998,14 +1041,16 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txs txid (hash) index...")
+		log.Printf("  ...done in %s. Starting txs txid (hash) index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);"); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - block_txs block_id, n primary key...")
+		log.Printf("  ...done in %s. Starting block_txs block_id, n primary key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        DO $$
        BEGIN
@@ -1018,14 +1063,16 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - block_txs tx_id index...")
+		log.Printf("  ...done in %s. Starting block_txs tx_id index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS block_txs_tx_id_idx ON block_txs(tx_id);"); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - hash_type function...")
+		log.Printf("  ...done in %s. Creatng hash_type function...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        CREATE OR REPLACE FUNCTION hash_type(_hash BYTEA) RETURNS TEXT AS $$
        BEGIN
@@ -1041,14 +1088,16 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txins (prevout_tx_id, prevout_tx_n) index...")
+		log.Printf("  ...done in %s. Starting txins (prevout_tx_id, prevout_tx_n) index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS txins_prevout_tx_id_prevout_n_idx ON txins(prevout_tx_id, prevout_n);"); err != nil {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txins primary key...")
+		log.Printf("  ...done in %s. Starting txins primary key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        DO $$
        BEGIN
@@ -1061,8 +1110,9 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txouts primary key...")
+		log.Printf("  ...done in %s. Starting txouts primary key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        DO $$
        BEGIN
@@ -1075,8 +1125,9 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txouts address prefix index...")
+		log.Printf("  ...done in %s. Starting txouts address prefix index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
            CREATE OR REPLACE FUNCTION extract_address(scriptPubKey BYTEA) RETURNS BYTEA AS $$
            BEGIN
@@ -1103,7 +1154,7 @@ func createIndexes(db *sql.DB, verbose bool) error {
            -- Address prefix (txout)
            CREATE OR REPLACE FUNCTION addr_prefix(scriptPubKey BYTEA) RETURNS BIGINT AS $$
            BEGIN
-             RETURN bytes2int8(extract_address(scriptPubKey));
+             RETURN public.bytes2int8(public.extract_address(scriptPubKey));
            END;
            $$ LANGUAGE plpgsql IMMUTABLE;
 
@@ -1112,8 +1163,9 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txins address prefix index...")
+		log.Printf("  ...done in %s. Starting txins address prefix index...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
         CREATE OR REPLACE FUNCTION parse_witness(witness BYTEA) RETURNS BYTEA[] AS $$
         DECLARE
@@ -1203,13 +1255,18 @@ func createIndexes(db *sql.DB, verbose bool) error {
        `); err != nil {
 		return err
 	}
+	if verbose {
+		log.Printf("  ...done in %s.", time.Now().Sub(start).Round(time.Millisecond))
+	}
 	return nil
 }
 
 func createConstraints(db *sql.DB, verbose bool) error {
+	var start time.Time
 	if verbose {
-		log.Printf("  - block_txs block_id foreign key...")
+		log.Printf("  Starting block_txs block_id foreign key...")
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
 	   DO $$
 	   BEGIN
@@ -1223,8 +1280,9 @@ func createConstraints(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - block_txs tx_id foreign key...")
+		log.Printf("  ...done in %s. Starting block_txs tx_id foreign key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
 	   DO $$
 	   BEGIN
@@ -1238,8 +1296,9 @@ func createConstraints(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txins tx_id foreign key...")
+		log.Printf("  ...done in %s. Starting txins tx_id foreign key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        DO $$
        BEGIN
@@ -1253,8 +1312,9 @@ func createConstraints(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  - txouts tx_id foreign key...")
+		log.Printf("  ...done in %s. Starting txouts tx_id foreign key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
+	start = time.Now()
 	if _, err := db.Exec(`
        DO $$
        BEGIN
@@ -1266,6 +1326,9 @@ func createConstraints(db *sql.DB, verbose bool) error {
        END
        $$;`); err != nil {
 		return err
+	}
+	if verbose {
+		log.Printf("  ...done in %s.", time.Now().Sub(start).Round(time.Millisecond))
 	}
 	return nil
 }
@@ -1402,6 +1465,23 @@ ORDER BY t.id;
 			return err
 		}
 		cache.add(hash, txid, cnt)
+	}
+	return nil
+}
+
+func takeSnapshot(db *sql.DB, dataset string, height int, tag string) error {
+	log.Printf("Taking a ZFS snapshot: %s@%d%s", dataset, height, tag)
+	log.Printf("  calling pg_start_backup('blkchain', true)")
+	if _, err := db.Exec(`SELECT pg_start_backup('blkchain', true)`); err != nil {
+		return err
+	}
+	log.Printf("  executing COPY (SELECT) TO PROGRAM 'zfs snapshot %s@%d%s'", dataset, height, tag)
+	if _, err := db.Exec(fmt.Sprintf(`COPY (SELECT) TO PROGRAM 'zfs snapshot %s@%d%s'`, dataset, height, tag)); err != nil {
+		return err
+	}
+	log.Printf("  calling pg_stop_backup()")
+	if _, err := db.Exec(`SELECT pg_stop_backup()`); err != nil {
+		return err
 	}
 	return nil
 }
