@@ -2,6 +2,7 @@ package db
 
 import (
 	"log"
+	"runtime"
 	"sync"
 
 	"github.com/blkchain/blkchain"
@@ -175,7 +176,9 @@ func (c *txIdCache) check(hash blkchain.Uint256) *int64 {
 }
 
 func (c *txIdCache) reportStats() {
-	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d dupes: %d evictions: %d size: %d",
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	log.Printf("Txid cache hits: %d (%.02f%%) misses: %d collisions: %d dupes: %d evictions: %d size: %d procmem: %d MiB",
 		c.hits, float64(c.hits)/(float64(c.hits+c.miss)+0.0001)*100,
-		c.miss, c.cols, c.dups, c.evic, len(c.m))
+		c.miss, c.cols, c.dups, c.evic, len(c.m), m.Sys/1024/1024)
 }

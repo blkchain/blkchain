@@ -43,47 +43,49 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer, zfsDataset string
 
 	start := time.Now()
 
-	var wg sync.WaitGroup
+	var (
+		wg sync.WaitGroup
 
-	var db *sql.DB
+		firstImport = true
 
-	if connstr == "nulldb" {
-		db, _ = sql.Open("nulldb", "")
-	} else {
-		var err error
-		if db, err = sql.Open("postgres", connstr); err != nil {
+		db  *sql.DB
+		err error
+	)
+
+	if connstr != "nulldb" {
+		db, err = sql.Open("postgres", connstr)
+		if err != nil {
 			return nil, err
 		}
-	}
 
-	if err := createPgcrypto(db); err != nil {
-		return nil, err
-	}
-
-	firstImport := true // firstImport == first import
-	if err := createTables(db); err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			// this is fine, cancel deferred index/constraint creation
-			firstImport = false
-			log.Printf("Tables already exist, catching up.")
-		} else {
+		if err := createPgcrypto(db); err != nil {
 			return nil, err
 		}
-	}
 
-	if firstImport {
-		if utxo == nil {
-			return nil, fmt.Errorf("First import must be done with UTXO checker, i.e. from LevelDb directly. (utxo == nil)")
+		if err := createTables(db); err != nil {
+			if strings.Contains(err.Error(), "already exists") {
+				// this is fine, cancel deferred index/constraint creation
+				firstImport = false
+				log.Printf("Tables already exist, catching up.")
+			} else {
+				return nil, err
+			}
 		}
-		log.Printf("Tables created without indexes, which are created at the very end.")
-		if err := setTableStorageParams(db); err != nil {
+
+		if firstImport {
+			if utxo == nil {
+				return nil, fmt.Errorf("First import must be done with UTXO checker, i.e. from LevelDb directly. (utxo == nil)")
+			}
+			log.Printf("Tables created without indexes, which are created at the very end.")
+			if err := setTableStorageParams(db); err != nil {
+				return nil, err
+			}
+			log.Printf("Disabled autovacuum/analyze for the initial import.")
+		}
+
+		if err := createPrevoutMissTable(db); err != nil {
 			return nil, err
 		}
-		log.Printf("Disabled autovacuum/analyze for the initial import.")
-	}
-
-	if err := createPrevoutMissTable(db); err != nil {
-		return nil, err
 	}
 
 	bch := make(chan *blockRecSync, 2)
@@ -333,7 +335,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		// report progress
 		if time.Now().Sub(lastStatus) > 5*time.Second {
 			uptime := w.Uptime().Round(time.Second)
-			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f KB/s: %02f Uptime: %s",
+			log.Printf("Height: %d Txs: %d Time: %v Tx/s: %02f KB/s: %02f Runtime: %s",
 				br.Height, txcnt,
 				time.Unix(int64(br.Time), 0),
 				float64(txcnt)/time.Now().Sub(start).Seconds(),
@@ -362,6 +364,10 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	}
 
 	idCache.reportStats() // Final stats ane last time
+
+	if w.db == nil {
+		return
+	}
 
 	verbose := firstImport
 
@@ -466,23 +472,25 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 			continue
 		}
 
-		b := br.Block
-		_, err = stmt.Exec(
-			br.Id,
-			br.Height,
-			br.Hash[:],
-			int32(b.Version),
-			b.PrevHash[:],
-			b.HashMerkleRoot[:],
-			int32(b.Time),
-			int32(b.Bits),
-			int32(b.Nonce),
-			br.Orphan,
-			br.Size(),
-			br.BaseSize(),
-			br.Weight(),
-			br.VirtualSize(),
-		)
+		if stmt != nil {
+			b := br.Block
+			_, err = stmt.Exec(
+				br.Id,
+				br.Height,
+				br.Hash[:],
+				int32(b.Version),
+				b.PrevHash[:],
+				b.HashMerkleRoot[:],
+				int32(b.Time),
+				int32(b.Bits),
+				int32(b.Nonce),
+				br.Orphan,
+				br.Size(),
+				br.BaseSize(),
+				br.Weight(),
+				br.VirtualSize(),
+			)
+		}
 		if err != nil {
 			log.Printf("ERROR (3): %v", err)
 		}
@@ -535,17 +543,19 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 
 		if !tr.dupe {
 
-			t := tr.tx
-			_, err = stmt.Exec(
-				tr.id,
-				tr.hash[:],
-				int32(t.Version),
-				int32(t.LockTime),
-				t.Size(),
-				t.BaseSize(),
-				t.Weight(),
-				t.VirtualSize(),
-			)
+			if stmt != nil {
+				t := tr.tx
+				_, err = stmt.Exec(
+					tr.id,
+					tr.hash[:],
+					int32(t.Version),
+					int32(t.LockTime),
+					t.Size(),
+					t.BaseSize(),
+					t.Weight(),
+					t.VirtualSize(),
+				)
+			}
 			if err != nil {
 				log.Printf("ERROR (7): %v", err)
 			}
@@ -553,11 +563,13 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			// cache is empty, which is why we warmupCache.
 		}
 
-		_, err = bstmt.Exec(
-			tr.blockId,
-			tr.n,
-			tr.id,
-		)
+		if bstmt != nil {
+			_, err = bstmt.Exec(
+				tr.blockId,
+				tr.n,
+				tr.id,
+			)
+		}
 		if err != nil {
 			log.Printf("ERROR (7.5): %v", err)
 		}
@@ -628,15 +640,17 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 			}
 		}
 
-		_, err = stmt.Exec(
-			tr.txId,
-			tr.n,
-			prevOutTxId,
-			int32(t.PrevOut.N),
-			t.ScriptSig,
-			int32(t.Sequence),
-			wb,
-		)
+		if stmt != nil {
+			_, err = stmt.Exec(
+				tr.txId,
+				tr.n,
+				prevOutTxId,
+				int32(t.PrevOut.N),
+				t.ScriptSig,
+				int32(t.Sequence),
+				wb,
+			)
+		}
 		if err != nil {
 			log.Printf("ERROR (11): %v", err)
 		}
@@ -687,14 +701,16 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 			spent = !isUTXO
 		}
 
-		t := tr.txOut
-		_, err = stmt.Exec(
-			tr.txId,
-			tr.n,
-			t.Value,
-			t.ScriptPubKey,
-			spent,
-		)
+		if stmt != nil {
+			t := tr.txOut
+			_, err = stmt.Exec(
+				tr.txId,
+				tr.n,
+				t.Value,
+				t.ScriptPubKey,
+				spent,
+			)
+		}
 		if err != nil {
 			log.Printf("ERROR (13.6): %v\n", err)
 		}
@@ -708,6 +724,10 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 }
 
 func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) {
+	if db == nil {
+		return nil, nil, nil
+	}
+
 	txn, err := db.Begin()
 	if err != nil {
 		return nil, nil, err
@@ -723,6 +743,9 @@ func begin(db *sql.DB, table string, cols []string) (*sql.Tx, *sql.Stmt, error) 
 }
 
 func commit(stmt *sql.Stmt, txn *sql.Tx, misses []*prevoutMiss) (err error) {
+	if stmt == nil {
+		return nil
+	}
 	if _, err = stmt.Exec(); err != nil {
 		return err
 	}
@@ -748,6 +771,9 @@ func commit(stmt *sql.Stmt, txn *sql.Tx, misses []*prevoutMiss) (err error) {
 }
 
 func getHeightAndHashes(db *sql.DB, back int) (map[int][]blkchain.Uint256, error) {
+	if db == nil {
+		return nil, nil
+	}
 
 	stmt := `SELECT height, hash FROM blocks
 		WHERE height > (SELECT MAX(height) FROM blocks) - $1`
@@ -781,6 +807,9 @@ func getHeightAndHashes(db *sql.DB, back int) (map[int][]blkchain.Uint256, error
 }
 
 func getLastBlockId(db *sql.DB) (int, error) {
+	if db == nil {
+		return 0, nil
+	}
 
 	rows, err := db.Query("SELECT id FROM blocks ORDER BY id DESC LIMIT 1")
 	if err != nil {
@@ -799,6 +828,9 @@ func getLastBlockId(db *sql.DB) (int, error) {
 }
 
 func getLastTxId(db *sql.DB) (int64, error) {
+	if db == nil {
+		return 0, nil
+	}
 
 	rows, err := db.Query("SELECT id FROM txs ORDER BY id DESC LIMIT 1")
 	if err != nil {

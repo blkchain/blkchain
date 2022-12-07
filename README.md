@@ -136,6 +136,13 @@ they are announced and write them to the DB. For example:
 
 ## PostgreSQL Tuning
 
+* Do not underestimate the importance of the sending (client) machine
+  performance, it is possible that the client side cannot keep up with
+  Postgres. You can specify `-connstr nulldb` to make all database
+  operations noops, akin to writing to /dev/null. Try running it this
+  way to see the maximum speed you client is capable of before
+  attempting to tune the Postgres side.
+
 * Using SSD's on the Postgres server (as well as the sending machine) will
   make this process go much faster. Remember to set `random_page_cost`
   to `1` or less, depending on how fast your disk really is. The

@@ -1,6 +1,6 @@
 module github.com/blkchain/blkchain
 
-go 1.15
+go 1.18
 
 require (
 	github.com/btcsuite/btcd v0.23.3
@@ -10,4 +10,16 @@ require (
 	github.com/jmoiron/sqlx v1.3.1
 	github.com/lib/pq v1.9.0
 	github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
+)
+
+require (
+	github.com/btcsuite/btcd/btcutil v1.1.0 // indirect
+	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/decred/dcrd/crypto/blake256 v1.0.0 // indirect
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
+	github.com/decred/dcrd/lru v1.0.0 // indirect
+	github.com/golang/snappy v0.0.4 // indirect
+	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9 // indirect
+	golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a // indirect
 )

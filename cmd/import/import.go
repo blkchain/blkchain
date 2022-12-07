@@ -19,7 +19,7 @@ import (
 
 func main() {
 
-	connStr := flag.String("connstr", "host=/var/run/postgresql dbname=blocks sslmode=disable", "Db connection string")
+	connStr := flag.String("connstr", "host=/var/run/postgresql dbname=blocks sslmode=disable", "Db connection string ('nulldb' == /dev/null)")
 	nodeAddr := flag.String("nodeaddr", "", "Bitcoin node address")
 	nodeTmout := flag.Int("nodetmout", 30, "Bitcoin node timeout in seconds")
 	blocksPath := flag.String("blocks", "", "/path/to/blocks")
@@ -168,7 +168,7 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 	log.Printf("Connecting to Node (%s)...", addr)
 	node, err := btcnode.ConnectToNode(addr, tmout)
 	if err != nil {
-		log.Fatalf("ERROR: %v", err)
+		log.Fatalf("ERROR1: %v", err)
 	}
 
 	blkCh := make(chan *blkchain.Block, 8)
@@ -208,7 +208,7 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 		blks, err := node.WaitForBlock(interrupt)
 		if err != nil {
 			if len(interrupt) == 0 {
-				log.Printf("ERROR: %v", err)
+				log.Printf("ERROR2: %v", err)
 			}
 		}
 
@@ -238,18 +238,18 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 
 	utxo, err := coredb.NewChainStateChecker(chainStatePath)
 	if err != nil {
-		log.Fatalf("ERROR: %v", err)
+		log.Fatalf("ERROR3: %v", err)
 	}
 	defer utxo.Close()
 
 	writer, err := db.NewPGWriter(dbconnect, cacheSize, utxo, zfsDataset)
 	if err != nil {
-		log.Fatalf("ERROR: %v", err)
+		log.Fatalf("ERROR4: %v", err)
 	}
 
 	lastHashes, err := writer.HeightAndHashes(1)
 	if err != nil {
-		log.Fatalf("ERROR: %v", err)
+		log.Fatalf("ERROR5: %v", err)
 	}
 
 	var lastHeight int
@@ -269,7 +269,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 	log.Printf("Reading block headers from LevelDb (%s)...", indexPath)
 	bhs, err := coredb.ReadLevelDbBlockHeaderIndex(indexPath, blocksPath, magic, startHeight)
 	if err != nil {
-		log.Fatalf("ERROR: %v", err)
+		log.Fatalf("ERROR6: %v", err)
 		return
 	}
 	log.Printf("Read %d block headers.", bhs.Count())
