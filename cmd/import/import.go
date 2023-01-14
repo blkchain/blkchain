@@ -26,9 +26,11 @@ func main() {
 	indexPath := flag.String("index", "", "/path/to/blocks/index (levelDb)")
 	chainStatePath := flag.String("chainstate", "", "/path/to/blocks/chainstate (levelDb UTXO set)")
 	testNet := flag.Bool("testnet", false, "Use testnet magic")
-	cacheSize := flag.Int("cache-size", 30_000_000, "Tx hashes to cache for pervout_tx_id")
+	cacheSize := flag.Int("cache-size", 50_000_000, "Tx hashes to cache for pervout_tx_id")
 	wait := flag.Bool("wait", false, "Keep on waiting for blocks from Bitcoin node")
+	// NB: Remember to `zfs allow -u postgres snapshot,mount zroot/pgdata` if using zfs-dataset
 	zfsDataset := flag.String("zfs-dataset", "", "ZFS dataset to take snapshots of (empty = no snapshots)")
+	parallel := flag.Int("parallel", 8, "Parallelism for _prevout_miss update")
 
 	flag.Parse()
 
@@ -70,7 +72,7 @@ func main() {
 			log.Printf("Error setting rlimit: %v", err)
 			return
 		}
-		processEverythingLevelDb(*connStr, *blocksPath, *indexPath, *chainStatePath, magic, *cacheSize, *zfsDataset)
+		processEverythingLevelDb(*connStr, *blocksPath, *indexPath, *chainStatePath, magic, *cacheSize, *zfsDataset, *parallel)
 	}
 
 }
@@ -88,7 +90,7 @@ func processEverythingBtcNode(dbconnect, addr string, tmout time.Duration, cache
 		interrupt <- true
 	}()
 
-	writer, err := db.NewPGWriter(dbconnect, cacheSize, nil, "")
+	writer, err := db.NewPGWriter(dbconnect, cacheSize, nil, "", 1)
 	if err != nil {
 		log.Printf("Error creating writer: %v", err)
 		return
@@ -231,7 +233,7 @@ func processEachNewBlock(writer *db.PGWriter, addr string, tmout time.Duration, 
 	return nil
 }
 
-func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int, zfsDataset string) {
+func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath string, magic uint32, cacheSize int, zfsDataset string, parallel int) {
 
 	// TODO: This code won't deal with splits very well, but at this
 	// stage of the DB population it is very unlikely to happen anyway.
@@ -242,7 +244,7 @@ func processEverythingLevelDb(dbconnect, blocksPath, indexPath, chainStatePath s
 	}
 	defer utxo.Close()
 
-	writer, err := db.NewPGWriter(dbconnect, cacheSize, utxo, zfsDataset)
+	writer, err := db.NewPGWriter(dbconnect, cacheSize, utxo, zfsDataset, parallel)
 	if err != nil {
 		log.Fatalf("ERROR4: %v", err)
 	}

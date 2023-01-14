@@ -33,13 +33,14 @@ type PGWriter struct {
 	db         *sql.DB
 	start      time.Time
 	zfsDataset string
+	parallel   int
 }
 
 type isUTXOer interface {
 	IsUTXO(blkchain.Uint256, uint32) (bool, error)
 }
 
-func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer, zfsDataset string) (*PGWriter, error) {
+func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer, zfsDataset string, parallel int) (*PGWriter, error) {
 
 	start := time.Now()
 
@@ -77,10 +78,10 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer, zfsDataset string
 				return nil, fmt.Errorf("First import must be done with UTXO checker, i.e. from LevelDb directly. (utxo == nil)")
 			}
 			log.Printf("Tables created without indexes, which are created at the very end.")
+			log.Printf("Setting table parameters: autovacuum_enabled=false")
 			if err := setTableStorageParams(db); err != nil {
 				return nil, err
 			}
-			log.Printf("Disabled autovacuum/analyze for the initial import.")
 		}
 
 		if err := createPrevoutMissTable(db); err != nil {
@@ -97,6 +98,7 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer, zfsDataset string
 		db:         db,
 		start:      start,
 		zfsDataset: zfsDataset,
+		parallel:   parallel,
 	}
 
 	go w.pgBlockWorker(bch, &wg, firstImport, cacheSize, utxo)
@@ -211,7 +213,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	}
 
 	txcnt, start, lastStatus, lastCacheStatus, lastHeight := 0, time.Now(), time.Now(), 0, -1
-	blkCnt, blkSz := 0, 0
+	blkCnt, blkSz, batchSz := 0, 0, 0
 	for br := range ch {
 		bid++
 		blkCnt++
@@ -247,6 +249,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		lastHeight = br.Height
 
 		blkSz += br.Size()
+		batchSz += br.Size()
 		blockCh <- br
 
 		for n, tx := range br.Txs {
@@ -263,7 +266,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 				blockId: bid,
 				tx:      tx,
 				hash:    hash,
-				dupe:    recentId != txid,
+				dupe:    recentId != txid, // dupes are not written but referred to in block_txs
 			}
 
 			if recentId != txid {
@@ -326,10 +329,13 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 			}
 		} else if bid%1024 == 0 {
 			// commit every N blocks
-			blockCh <- nil
-			txCh <- nil
-			txInCh <- nil
-			txOutCh <- nil
+			if batchSz > 100_000_000 { // but not less than a specific batch size
+				batchSz = 0
+				blockCh <- nil
+				txCh <- nil
+				txInCh <- nil
+				txOutCh <- nil
+			}
 		}
 
 		// report progress
@@ -344,7 +350,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 			lastStatus = time.Now()
 			lastCacheStatus++
 			if lastCacheStatus == 5 {
-				idCache.reportStats()
+				idCache.reportStats(false)
 				lastCacheStatus = 0
 			}
 		}
@@ -363,7 +369,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		return
 	}
 
-	idCache.reportStats() // Final stats ane last time
+	idCache.reportStats(true) // Final stats ane last time
 
 	if w.db == nil {
 		return
@@ -375,18 +381,14 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		idCache.clear()
 		log.Printf("Cleared the cache.")
 
-		if len(w.zfsDataset) > 0 {
-			takeSnapshot(w.db, w.zfsDataset, lastHeight, "-preindex")
-		}
-
-		log.Printf("Creating indexes (if needed), please be patient, this may take a long time...")
-		if err := createIndexes(w.db, verbose); err != nil {
+		// First only indexes necessary for fixPrevoutTxId
+		log.Printf("Creating indexes part 1, please be patient, this may take a long time...")
+		if err := createIndexes1(w.db, verbose); err != nil {
 			log.Printf("Error creating indexes: %v", err)
 		}
 
-		log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
-		if err := createConstraints(w.db, verbose); err != nil {
-			log.Printf("Error creating constraints: %v", err)
+		if len(w.zfsDataset) > 0 {
+			takeSnapshot(w.db, w.zfsDataset, lastHeight, "-preindex")
 		}
 
 		if idCache.miss > 0 {
@@ -398,12 +400,24 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 			log.Printf("...done in %s. Fixing missing prevout_tx_id entries (if needed), this may take a long time..",
 				time.Now().Sub(start).Round(time.Millisecond))
 			start = time.Now()
-			if err := fixPrevoutTxId(w.db); err != nil {
+			if err := fixPrevoutTxId(w.db, w.parallel, true); err != nil {
 				log.Printf("Error fixing prevout_tx_id: %v", err)
 			}
 			log.Printf("...done in %s.", time.Now().Sub(start).Round(time.Millisecond))
 		} else {
 			log.Printf("NOT fixing missing prevout_tx_id entries because there were 0 cache misses.")
+		}
+
+		// Now the rest of the indexes
+		log.Printf("Creating indexes part 2, please be patient, this may take a long time...")
+		if err := createIndexes2(w.db, verbose); err != nil {
+			log.Printf("Error creating indexes: %v", err)
+		}
+
+		// Finally constraints
+		log.Printf("Creating constraints (if needed), please be patient, this may take a long time...")
+		if err := createConstraints(w.db, verbose); err != nil {
+			log.Printf("Error creating constraints: %v", err)
 		}
 
 		// NOTE: It is imperative that this trigger is created *after* the fixPrevoutTxId() call, or else these
@@ -414,10 +428,6 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 			log.Printf("Error creating txins triggers: %v", err)
 		}
 
-		if err := resetTableStorageParams(w.db); err != nil {
-			log.Printf("Error resetting storage parameters: %v", err)
-		}
-		log.Printf("Autovacuum/analyze re-enabled.")
 	}
 
 	log.Printf("Dropping _prevout_miss table.")
@@ -439,6 +449,10 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	log.Printf("Done marking orphan blocks in %s.", time.Now().Sub(start).Round(time.Millisecond))
 
 	if firstImport {
+		if err := resetTableStorageParams(w.db); err != nil {
+			log.Printf("Error resetting storage parameters: %v", err)
+		}
+		log.Printf("Reset table storage parameters: autovacuum_enabled.")
 		log.Printf("Indexes and constraints created.")
 		if len(w.zfsDataset) > 0 {
 			takeSnapshot(w.db, w.zfsDataset, lastHeight, "-postindex")
@@ -459,7 +473,7 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 	for br := range c {
 
 		if br == nil || br.BlockRec == nil { // commit signal
-			if err = commit(stmt, txn, nil); err != nil {
+			if err := commit(stmt, txn, nil); err != nil {
 				log.Printf("Block commit error: %v", err)
 			}
 			txn, stmt, err = begin(db, "blocks", cols)
@@ -474,7 +488,7 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 
 		if stmt != nil {
 			b := br.Block
-			_, err = stmt.Exec(
+			if _, err := stmt.Exec(
 				br.Id,
 				br.Height,
 				br.Hash[:],
@@ -489,10 +503,10 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 				br.BaseSize(),
 				br.Weight(),
 				br.VirtualSize(),
-			)
-		}
-		if err != nil {
-			log.Printf("ERROR (3): %v", err)
+			); err != nil {
+				log.Printf("ERROR (3): %v", err)
+
+			}
 		}
 	}
 
@@ -519,14 +533,69 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 		log.Printf("ERROR (4): %v", err)
 	}
 
+	// It's not clear that parallelizing Txs provides any speed
+	// advntage, but whatever.
+
+	nWorkers := 3
+	wch := make(chan *txRec, 4)
+	var wg sync.WaitGroup
+	worker := func() {
+		wg.Add(1)
+		defer wg.Done()
+		for tr := range wch {
+
+			if !tr.dupe {
+
+				if stmt != nil {
+					t := tr.tx
+					if _, err := stmt.Exec(
+						tr.id,
+						tr.hash[:],
+						int32(t.Version),
+						int32(t.LockTime),
+						t.Size(),
+						t.BaseSize(),
+						t.Weight(),
+						t.VirtualSize(),
+					); err != nil {
+						log.Printf("ERROR (7): %v", err)
+					}
+				}
+				// It can still be a dupe if we are catching up and the
+				// cache is empty, which is why we warmupCache.
+			}
+
+			if bstmt != nil {
+				if _, err := bstmt.Exec(
+					tr.blockId,
+					tr.n,
+					tr.id,
+				); err != nil {
+					log.Printf("ERROR (7.5): %v", err)
+				}
+			}
+
+		}
+	}
+
+	// initital start workers
+	for i := 0; i < nWorkers; i++ {
+		go worker()
+	}
+
 	for tr := range c {
 		if tr == nil || tr.tx == nil { // commit signal
-			if err = commit(stmt, txn, nil); err != nil {
+			// close channel, wait for workers to finish
+			close(wch)
+			wg.Wait()
+			// commit
+			if err := commit(stmt, txn, nil); err != nil {
 				log.Printf("Tx commit error: %v", err)
 			}
 			if err = commit(bstmt, btxn, nil); err != nil {
 				log.Printf("Block Txs commit error: %v", err)
 			}
+			var err error
 			txn, stmt, err = begin(db, "txs", cols)
 			if err != nil {
 				log.Printf("ERROR (5): %v", err)
@@ -538,49 +607,24 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			if tr != nil && tr.sync != nil {
 				tr.sync <- true
 			}
+			// make a new channel, restart workers
+			wch = make(chan *txRec, 4)
+			for i := 0; i < nWorkers; i++ {
+				go worker()
+			}
 			continue
 		}
-
-		if !tr.dupe {
-
-			if stmt != nil {
-				t := tr.tx
-				_, err = stmt.Exec(
-					tr.id,
-					tr.hash[:],
-					int32(t.Version),
-					int32(t.LockTime),
-					t.Size(),
-					t.BaseSize(),
-					t.Weight(),
-					t.VirtualSize(),
-				)
-			}
-			if err != nil {
-				log.Printf("ERROR (7): %v", err)
-			}
-			// It can still be a dupe if we are catching up and the
-			// cache is empty, which is why we warmupCache.
-		}
-
-		if bstmt != nil {
-			_, err = bstmt.Exec(
-				tr.blockId,
-				tr.n,
-				tr.id,
-			)
-		}
-		if err != nil {
-			log.Printf("ERROR (7.5): %v", err)
-		}
+		wch <- tr
 	}
+	close(wch)
+	wg.Wait()
 
 	log.Printf("Tx writer channel closed, committing transaction.")
 
-	if err = commit(stmt, txn, nil); err != nil {
+	if err := commit(stmt, txn, nil); err != nil {
 		log.Printf("Tx commit error: %v", err)
 	}
-	if err = commit(bstmt, btxn, nil); err != nil {
+	if err := commit(bstmt, btxn, nil); err != nil {
 		log.Printf("Block Txs commit error: %v", err)
 	}
 
@@ -599,12 +643,94 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 
 	misses := make([]*prevoutMiss, 0, 2000)
 
+	// Parallelizing txins provides a small speed up, especially
+	// during first import when we write misses to the db directly. We
+	// also have a dedicated worker for prevout misses during
+	// firstImport.
+
+	nWorkers := 8
+	wch := make(chan *txInRec, 4)
+	mch := make(chan *prevoutMiss, 64)
+	var (
+		wg sync.WaitGroup
+		mg sync.WaitGroup
+	)
+
+	missWriter := func() { // prevoutMiss recorder
+		mg.Add(1)
+		defer mg.Done()
+		for miss := range mch {
+			// write it to the DB directly
+			if stmt != nil {
+				if err := recordPrevoutMiss(db, miss.txId, miss.n, miss.prevOutHash); err != nil {
+					log.Printf("ERROR (10.7): %v", err)
+				}
+			}
+		}
+	}
+
+	worker := func() {
+		wg.Add(1)
+		defer wg.Done()
+		for tr := range wch {
+
+			t := tr.txIn
+			var wb interface{}
+			if t.Witness != nil {
+				var b bytes.Buffer
+				blkchain.BinWrite(&t.Witness, &b)
+				wb = b.Bytes()
+			}
+
+			var prevOutTxId *int64 = nil
+			if t.PrevOut.N != 0xffffffff { // coinbase
+				prevOutTxId = tr.idCache.check(t.PrevOut.Hash)
+
+				if prevOutTxId == nil { // cache miss
+					if firstImport {
+						mch <- &prevoutMiss{tr.txId, tr.n, t.PrevOut.Hash}
+					} else {
+						// remember it, it will be written just when needed
+						misses = append(misses, &prevoutMiss{tr.txId, tr.n, t.PrevOut.Hash})
+					}
+				}
+			}
+
+			if stmt != nil {
+				if _, err := stmt.Exec(
+					tr.txId,
+					tr.n,
+					prevOutTxId,
+					int32(t.PrevOut.N),
+					t.ScriptSig,
+					int32(t.Sequence),
+					wb,
+				); err != nil {
+					log.Printf("ERROR (11): %v", err)
+				}
+			}
+		}
+	}
+
+	// initital start workers
+	go missWriter()
+	for i := 0; i < nWorkers; i++ {
+		go worker()
+	}
+
 	for tr := range c {
 		if tr == nil || tr.txIn == nil { // commit signal
-			if err = commit(stmt, txn, misses); err != nil {
+			// close channel, wait for workers to finish
+			close(wch)
+			wg.Wait()
+			close(mch)
+			mg.Wait()
+			// commit
+			if err := commit(stmt, txn, misses); err != nil {
 				log.Printf("Txin commit error: %v", err)
 			}
 			misses = misses[:0]
+			var err error
 			txn, stmt, err = begin(db, "txins", cols)
 			if err != nil {
 				log.Printf("ERROR (10): %v", err)
@@ -612,52 +738,24 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 			if tr != nil && tr.sync != nil {
 				tr.sync <- true
 			}
+			// make a new channel, restart workers
+			mch = make(chan *prevoutMiss, 64)
+			go missWriter()
+			wch = make(chan *txInRec, 4)
+			for i := 0; i < nWorkers; i++ {
+				go worker()
+			}
 			continue
 		}
-
-		t := tr.txIn
-		var wb interface{}
-		if t.Witness != nil {
-			var b bytes.Buffer
-			blkchain.BinWrite(&t.Witness, &b)
-			wb = b.Bytes()
-		}
-
-		var prevOutTxId *int64 = nil
-		if t.PrevOut.N != 0xffffffff { // coinbase
-			prevOutTxId = tr.idCache.check(t.PrevOut.Hash)
-
-			if prevOutTxId == nil { // cache miss
-				if firstImport {
-					// write it to the DB directly
-					if err := recordPrevoutMiss(db, tr.txId, tr.n, t.PrevOut.Hash); err != nil {
-						log.Printf("ERROR (10.7): %v", err)
-					}
-				} else {
-					// remember it, it will be written just when needed
-					misses = append(misses, &prevoutMiss{tr.txId, tr.n, t.PrevOut.Hash})
-				}
-			}
-		}
-
-		if stmt != nil {
-			_, err = stmt.Exec(
-				tr.txId,
-				tr.n,
-				prevOutTxId,
-				int32(t.PrevOut.N),
-				t.ScriptSig,
-				int32(t.Sequence),
-				wb,
-			)
-		}
-		if err != nil {
-			log.Printf("ERROR (11): %v", err)
-		}
+		wch <- tr
 	}
+	close(wch)
+	wg.Wait()
+	close(mch)
+	mg.Wait()
 
 	log.Printf("TxIn writer channel closed, committing transaction.")
-	if err = commit(stmt, txn, misses); err != nil {
+	if err := commit(stmt, txn, misses); err != nil {
 		log.Printf("TxIn commit error: %v", err)
 	}
 	log.Printf("TxIn writer done.")
@@ -673,12 +771,56 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 		log.Printf("ERROR (12): %v", err)
 	}
 
-	for tr := range c {
+	// The call to IsUTXO() is very time consuming because it involves
+	// LevelDb, parallelizing here provides a huge speed up.
+	nWorkers := 8
+	wch := make(chan *txOutRec, 4)
+	var wg sync.WaitGroup
+	worker := func() {
+		wg.Add(1)
+		defer wg.Done()
+		for tr := range wch {
+			var spent bool
+			if utxo != nil {
+				// NB: Some early unspent coins are not in the UTXO set,
+				// probably because they are not spendable? So the spent
+				// flag could also be interpeted as unspendable.
+				isUTXO, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
+				if err != nil {
+					log.Printf("ERROR (13.5): %v", err)
+				}
+				spent = !isUTXO
+			}
+			if stmt != nil {
+				t := tr.txOut
+				if _, err := stmt.Exec(
+					tr.txId,
+					tr.n,
+					t.Value,
+					t.ScriptPubKey,
+					spent,
+				); err != nil {
+					log.Printf("ERROR (13.6): %v\n", err)
+				}
+			}
+		}
+	}
 
+	// initital start workers
+	for i := 0; i < nWorkers; i++ {
+		go worker()
+	}
+
+	for tr := range c {
 		if tr == nil || tr.txOut == nil { // commit signal
-			if err = commit(stmt, txn, nil); err != nil {
+			// close channel, wait for workers to finish
+			close(wch)
+			wg.Wait()
+			// commit
+			if err := commit(stmt, txn, nil); err != nil {
 				log.Printf("TxOut commit error: %v", err)
 			}
+			var err error
 			txn, stmt, err = begin(db, "txouts", cols)
 			if err != nil {
 				log.Printf("ERROR (13): %v", err)
@@ -686,38 +828,20 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 			if tr != nil && tr.sync != nil {
 				tr.sync <- true
 			}
+			// make a new channel, restart workers
+			wch = make(chan *txOutRec, 4)
+			for i := 0; i < nWorkers; i++ {
+				go worker()
+			}
 			continue
 		}
-
-		var spent bool
-		if utxo != nil {
-			// NB: Some early unspent coins are not in the UTXO set,
-			// probably because they are not spendable? So the spent
-			// flag could also be interpeted as unspendable.
-			isUTXO, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
-			if err != nil {
-				log.Printf("ERROR (13.5): %v", err)
-			}
-			spent = !isUTXO
-		}
-
-		if stmt != nil {
-			t := tr.txOut
-			_, err = stmt.Exec(
-				tr.txId,
-				tr.n,
-				t.Value,
-				t.ScriptPubKey,
-				spent,
-			)
-		}
-		if err != nil {
-			log.Printf("ERROR (13.6): %v\n", err)
-		}
+		wch <- tr
 	}
+	close(wch)
+	wg.Wait()
 
 	log.Printf("TxOut writer channel closed, committing transaction.")
-	if err = commit(stmt, txn, nil); err != nil {
+	if err := commit(stmt, txn, nil); err != nil {
 		log.Printf("TxOut commit error: %v", err)
 	}
 	log.Printf("TxOut writer done.")
@@ -754,12 +878,14 @@ func commit(stmt *sql.Stmt, txn *sql.Tx, misses []*prevoutMiss) (err error) {
 	}
 	// We do this here because it is not possible to use Exec() during
 	// a pq.CopyIn operation, but we do want this done prior to the
-	// Commit.
+	// Commit. Note that misses is always empty during first import,
+	// which writes misses to the db directly, bypassing misses slice.
 	if len(misses) > 0 {
 		if err = recordPrevoutMisses(txn, misses); err != nil {
 			return err
 		}
-		if err = fixPrevoutTxId(txn); err != nil { // also truncates _prevout_miss
+		// TODO: Make the parallel argument below configurable?
+		if err = fixPrevoutTxId(txn, 4, false); err != nil { // also truncates _prevout_miss
 			return err
 		}
 	}
@@ -851,29 +977,47 @@ func getLastTxId(db *sql.DB) (int64, error) {
 // This could be a db connection or a transaction
 type execer interface {
 	Exec(query string, args ...interface{}) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
 }
 
 func createPrevoutMissTable(db execer) error {
 	sql := `
      CREATE UNLOGGED TABLE IF NOT EXISTS _prevout_miss (
-          tx_id         BIGINT NOT NULL
+          id            SERIAL NOT NULL PRIMARY KEY
+         ,tx_id         BIGINT NOT NULL
          ,n             INT NOT NULL
          ,prevout_hash  BYTEA NOT NULL
      );
-     TRUNCATE _prevout_miss;
+     TRUNCATE _prevout_miss RESTART IDENTITY;
 `
 	_, err := db.Exec(sql)
 	return err
 }
 
 func clearPrevoutMissTable(db execer) error {
-	_, err := db.Exec("TRUNCATE _prevout_miss")
+	_, err := db.Exec("TRUNCATE _prevout_miss RESTART IDENTITY")
 	return err
 }
 
 func dropPrevoutMissTable(db *sql.DB) error {
 	_, err := db.Exec("DROP TABLE IF EXISTS _prevout_miss")
 	return err
+}
+
+func prevoutMissMaxId(db execer) (int, error) {
+	stmt := `SELECT MAX(id) FROM _prevout_miss`
+	rows, err := db.Query(stmt)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var max int
+	for rows.Next() {
+		if err := rows.Scan(&max); err != nil {
+			return 0, err
+		}
+	}
+	return max, nil
 }
 
 func recordPrevoutMiss(db *sql.DB, txId int64, n int, prevoutHash blkchain.Uint256) error {
@@ -915,18 +1059,59 @@ func recordPrevoutMisses(txn *sql.Tx, misses []*prevoutMiss) error {
 // import, but we need to correct the remaining ones. You can likely
 // avoid it by increasing the txIdCache size. After the first import
 // it will be looked up on the fly as needed, but a larger cache is
-// still important.
-func fixPrevoutTxId(db execer) error {
-	if _, err := db.Exec(`
-           UPDATE txins i
-              SET prevout_tx_id = t.id
-             FROM _prevout_miss m
-             JOIN txs t ON m.prevout_hash = t.txid
-            WHERE i.tx_id = m.tx_id
-              AND i.n = m.n
-        `); err != nil {
+// still important. We run it in parallel to speed things up.
+func fixPrevoutTxId(db execer, parallel int, verbose bool) error {
+	if parallel == 0 {
+		parallel = 1
+	}
+	stmt := `
+UPDATE txins i
+   SET prevout_tx_id = t.id
+  FROM _prevout_miss m
+  JOIN txs t ON m.prevout_hash = t.txid
+ WHERE m.id >= $1 AND m.id < $2
+   AND i.tx_id = m.tx_id
+   AND i.n = m.n`
+
+	max, err := prevoutMissMaxId(db)
+	if err != nil {
 		return err
 	}
+	if verbose {
+		log.Printf("  max prevoutMiss id: %d parallel: %d", max, parallel)
+	}
+
+	step := max / (parallel - 1) // -1 because we do not one left over
+	if step > 10000 {
+		step = 10000 // kinda arbitrary - the idea is to show progress
+	}
+
+	// Start workers
+	type startEnd struct{ start, end int }
+	queue := make(chan startEnd)
+	var wg sync.WaitGroup
+	for i := 0; i < parallel; i++ {
+		go func(queue chan startEnd) {
+			wg.Add(1)
+			defer wg.Done()
+
+			for se := range queue {
+				if verbose {
+					log.Printf("  processing range [%d, %d) of %d...", se.start, se.end, max)
+				}
+				if _, err := db.Exec(stmt, se.start, se.end); err != nil {
+					log.Printf(" range [&d, %d) error: %v", se.start, se.end, err)
+				}
+			}
+		}(queue)
+	}
+
+	for i := 1; i <= max; i += step {
+		queue <- startEnd{i, i + step}
+	}
+	close(queue)
+	wg.Wait()
+
 	return clearPrevoutMissTable(db)
 }
 
@@ -993,6 +1178,11 @@ func createTables(db *sql.DB) error {
 	return err
 }
 
+// The approach we are taking here is to disable autovacuum during the
+// first import, then enabling it at the end and let it run. Because of hint
+// bits, the vacuum process will effectively rewrite every page of the table, this is explained here
+// https://dba.stackexchange.com/questions/130496/is-it-worth-it-to-run-vacuum-on-a-table-that-only-receives-inserts
+// NB: Setting UNLOGGED/LOGGED does not work as changing this setting rewrites the tables
 func setTableStorageParams(db *sql.DB) error {
 	for _, table := range []string{"blocks", "txs", "block_txs", "txins", "txouts"} {
 		stmt := fmt.Sprintf(`ALTER TABLE %s SET (autovacuum_enabled=false)`, table)
@@ -1002,7 +1192,6 @@ func setTableStorageParams(db *sql.DB) error {
 	}
 	return nil
 }
-
 func resetTableStorageParams(db *sql.DB) error {
 	for _, table := range []string{"blocks", "txs", "block_txs", "txins", "txouts"} {
 		stmt := fmt.Sprintf(`ALTER TABLE %s RESET (autovacuum_enabled)`, table)
@@ -1018,7 +1207,41 @@ func createPgcrypto(db *sql.DB) error {
 	return err
 }
 
-func createIndexes(db *sql.DB, verbose bool) error {
+// Create indexes only necessary to run fixPrevoutTxId(). Since we are
+// updating txins, a presense of the txins(addr_prefix(... index would
+// slow the updates down a great deal (updates cause an index update,
+// which calls the function).
+func createIndexes1(db *sql.DB, verbose bool) error {
+	var start time.Time
+	if verbose {
+		log.Printf("  Starting txins primary key...")
+	}
+	start = time.Now()
+	if _, err := db.Exec(`
+       DO $$
+       BEGIN
+         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
+                         WHERE table_name = 'txins' AND constraint_name = 'txins_pkey') THEN
+            ALTER TABLE txins ADD CONSTRAINT txins_pkey PRIMARY KEY(tx_id, n);
+         END IF;
+       END
+       $$;`); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  ...done in %s. Starting txs txid (hash) index...", time.Now().Sub(start).Round(time.Millisecond))
+	}
+	start = time.Now()
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);"); err != nil {
+		return err
+	}
+	if verbose {
+		log.Printf("  ...done in %s.", time.Now().Sub(start).Round(time.Millisecond))
+	}
+	return nil
+}
+
+func createIndexes2(db *sql.DB, verbose bool) error {
 	var start time.Time
 	// Adding a constraint or index if it does not exist is a little tricky in PG
 	if verbose {
@@ -1073,13 +1296,6 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  ...done in %s. Starting txs txid (hash) index...", time.Now().Sub(start).Round(time.Millisecond))
-	}
-	start = time.Now()
-	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS txs_txid_idx ON txs(txid);"); err != nil {
-		return err
-	}
-	if verbose {
 		log.Printf("  ...done in %s. Starting block_txs block_id, n primary key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
 	start = time.Now()
@@ -1127,21 +1343,6 @@ func createIndexes(db *sql.DB, verbose bool) error {
 		return err
 	}
 	if verbose {
-		log.Printf("  ...done in %s. Starting txins primary key...", time.Now().Sub(start).Round(time.Millisecond))
-	}
-	start = time.Now()
-	if _, err := db.Exec(`
-       DO $$
-       BEGIN
-         IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
-                         WHERE table_name = 'txins' AND constraint_name = 'txins_pkey') THEN
-            ALTER TABLE txins ADD CONSTRAINT txins_pkey PRIMARY KEY(tx_id, n);
-         END IF;
-       END
-       $$;`); err != nil {
-		return err
-	}
-	if verbose {
 		log.Printf("  ...done in %s. Starting txouts primary key...", time.Now().Sub(start).Round(time.Millisecond))
 	}
 	start = time.Now()
@@ -1181,14 +1382,14 @@ func createIndexes(db *sql.DB, verbose bool) error {
            BEGIN
              RETURN SUBSTR(bytes::text, 2, 16)::bit(64)::bigint;
            END;
-           $$ LANGUAGE plpgsql IMMUTABLE;
+           $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
            -- Address prefix (txout)
            CREATE OR REPLACE FUNCTION addr_prefix(scriptPubKey BYTEA) RETURNS BIGINT AS $$
            BEGIN
              RETURN public.bytes2int8(public.extract_address(scriptPubKey));
            END;
-           $$ LANGUAGE plpgsql IMMUTABLE;
+           $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
            CREATE INDEX IF NOT EXISTS txouts_addr_prefix_tx_id_idx ON txouts(addr_prefix(scriptpubkey), tx_id);
        `); err != nil {
@@ -1223,7 +1424,7 @@ func createIndexes(db *sql.DB, verbose bool) error {
           END LOOP;
           RETURN stack;
         END;
-        $$ LANGUAGE plpgsql IMMUTABLE;
+        $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
         CREATE OR REPLACE FUNCTION extract_address(scriptsig BYTEA, witness BYTEA) RETURNS BYTEA AS $$
         DECLARE
@@ -1272,14 +1473,14 @@ func createIndexes(db *sql.DB, verbose bool) error {
           END IF;
           RETURN NULL;
         END;
-        $$ LANGUAGE plpgsql IMMUTABLE;
+        $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
         -- Address prefix (txin)
         CREATE OR REPLACE FUNCTION addr_prefix(scriptsig BYTEA, witness BYTEA) RETURNS BIGINT AS $$
         BEGIN
           RETURN public.bytes2int8(public.extract_address(scriptsig, witness));
         END;
-        $$ LANGUAGE plpgsql IMMUTABLE;
+        $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
         -- Partial/conditional index because coinbase txin scriptsigs are garbage
         CREATE INDEX IF NOT EXISTS txins_addr_prefix_tx_id_idx ON txins(addr_prefix(scriptsig, witness), tx_id)
@@ -1503,17 +1704,45 @@ ORDER BY t.id;
 
 func takeSnapshot(db *sql.DB, dataset string, height int, tag string) error {
 	log.Printf("Taking a ZFS snapshot: %s@%d%s", dataset, height, tag)
-	log.Printf("  calling pg_start_backup('blkchain', true)")
-	if _, err := db.Exec(`SELECT pg_start_backup('blkchain', true)`); err != nil {
+	log.Printf("  calling pg_backup_start('blkchain', true)") // pg < 15 use pg_start_backup
+	if _, err := db.Exec(`SELECT pg_backupstart('blkchain', true)`); err != nil {
 		return err
 	}
 	log.Printf("  executing COPY (SELECT) TO PROGRAM 'zfs snapshot %s@%d%s'", dataset, height, tag)
 	if _, err := db.Exec(fmt.Sprintf(`COPY (SELECT) TO PROGRAM 'zfs snapshot %s@%d%s'`, dataset, height, tag)); err != nil {
 		return err
 	}
-	log.Printf("  calling pg_stop_backup()")
-	if _, err := db.Exec(`SELECT pg_stop_backup()`); err != nil {
+	log.Printf("  calling pg_backup_stop()") // pg < 15 use pg_stop_backup
+	if _, err := db.Exec(`SELECT pg_backup_stop()`); err != nil {
 		return err
 	}
 	return nil
+}
+
+// TODO: Presently unused
+func waitForAutovacuum(db *sql.DB) error {
+	avCount := func() (int, error) {
+		stmt := `SELECT COUNT(1) FROM pg_stat_activity WHERE query LIKE 'autovacuum:%'`
+		rows, err := db.Query(stmt)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		var cnt int
+		for rows.Next() {
+			if err := rows.Scan(&cnt); err != nil {
+				return 0, err
+			}
+		}
+		return cnt, nil
+	}
+	for {
+		if cnt, err := avCount(); err != nil {
+			log.Printf("waitForAutovacuum: %v", err)
+			return err
+		} else if cnt == 0 {
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
 }

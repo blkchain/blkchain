@@ -206,6 +206,7 @@ func ReadLevelDbBlockHeaderIndex(path, blocksPath string, magic uint32, startHei
 			result.m[int(bh.Height)] = append(list, &bh)
 		}
 		result.count++
+
 	}
 
 	log.Printf("Read %d block header entries.", result.count)
