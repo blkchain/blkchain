@@ -1081,9 +1081,16 @@ UPDATE txins i
 		log.Printf("  max prevoutMiss id: %d parallel: %d", max, parallel)
 	}
 
+	if max == 0 {
+		return nil // nothing to do
+	}
+
 	step := max / (parallel - 1) // -1 because we do not one left over
 	if step > 10000 {
 		step = 10000 // kinda arbitrary - the idea is to show progress
+	}
+	if step < 10 {
+		step = 10
 	}
 
 	// Start workers
