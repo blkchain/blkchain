@@ -1100,7 +1100,7 @@ UPDATE txins i
 					log.Printf("  processing range [%d, %d) of %d...", se.start, se.end, max)
 				}
 				if _, err := db.Exec(stmt, se.start, se.end); err != nil {
-					log.Printf(" range [&d, %d) error: %v", se.start, se.end, err)
+					log.Printf(" range [%d, %d) error: %v", se.start, se.end, err)
 				}
 			}
 		}(queue)
