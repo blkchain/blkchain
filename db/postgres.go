@@ -1529,7 +1529,7 @@ func createConstraints(db *sql.DB, verbose bool) error {
 	     -- NB: table_name is the target/foreign table
 	     IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
 	                     WHERE table_name = 'txs' AND constraint_name = 'block_txs_tx_id_fkey') THEN
-	       ALTER TABLE block_txs ADD CONSTRAINT block_txs_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
+	       ALTER TABLE block_txs ADD CONSTRAINT block_txs_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id) ON DELETE NO ACTION DEFERRABLE;
 	     END IF;
 	   END
 	   $$;`); err != nil {
@@ -1545,7 +1545,7 @@ func createConstraints(db *sql.DB, verbose bool) error {
          -- NB: table_name is the target/foreign table
          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
                          WHERE table_name = 'txs' AND constraint_name = 'txins_tx_id_fkey') THEN
-           ALTER TABLE txins ADD CONSTRAINT txins_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
+           ALTER TABLE txins ADD CONSTRAINT txins_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id) ON DELETE NO ACTION DEFERRABLE;
          END IF;
        END
        $$;`); err != nil {
@@ -1561,7 +1561,7 @@ func createConstraints(db *sql.DB, verbose bool) error {
          -- NB: table_name is the target/foreign table
          IF NOT EXISTS (SELECT constraint_name FROM information_schema.constraint_column_usage
                          WHERE table_name = 'txs' AND constraint_name = 'txouts_tx_id_fkey') THEN
-           ALTER TABLE txouts ADD CONSTRAINT txouts_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id);
+           ALTER TABLE txouts ADD CONSTRAINT txouts_tx_id_fkey FOREIGN KEY (tx_id) REFERENCES txs(id) ON DELETE NO ACTION DEFERRABLE;
          END IF;
        END
        $$;`); err != nil {
