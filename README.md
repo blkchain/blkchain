@@ -1,5 +1,5 @@
 
-# Bitcoin Blockchain Postgres Import
+# Fast Bitcoin Blockchain Postgres Import
 
 ## Introduction
 
