@@ -8,13 +8,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/blkchain/blkchain"
 	"github.com/blkchain/blkchain/btcnode"
 	"github.com/blkchain/blkchain/coredb"
 	"github.com/blkchain/blkchain/db"
+	"github.com/blkchain/blkchain/rlimit"
 )
 
 func main() {
@@ -68,7 +68,7 @@ func main() {
 
 	} else {
 		// Get block from levelDb
-		if err := setRLimit(1024); err != nil { // LevelDb opens many files!
+		if err := rlimit.SetRLimit(1024); err != nil { // LevelDb opens many files!
 			log.Printf("Error setting rlimit: %v", err)
 			return
 		}
@@ -323,27 +323,6 @@ func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, sync bool
 
 		if len(interrupt) > 0 {
 			break
-		}
-	}
-	return nil
-}
-
-func setRLimit(required uint64) error {
-	var rLimit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-		return err
-	}
-	if rLimit.Cur < required {
-		log.Printf("Setting open files rlimit of %d to %d.", rLimit.Cur, required)
-		rLimit.Cur = required
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-			return err
-		}
-		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-			return err
-		}
-		if rLimit.Cur < required {
-			return fmt.Errorf("Could not change open files rlimit to: %d", required)
 		}
 	}
 	return nil
