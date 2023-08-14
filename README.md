@@ -7,7 +7,7 @@ This is Go code aimed at importing the blockchain into Postgres as
 fast as possible. Licensed under the Apache License, Version 2.0
 
 This code can import the entire blockchain from a Bitcoin Core node
-into a PostgreSQL database in 38 hours on fairly basic hardware.
+into a PostgreSQL database in 37 hours on fairly basic hardware.
 
 Once the data is imported, the tool can append new blocks as they
 appear on the network by connecting to a Core node. You can then run
@@ -113,17 +113,17 @@ instance is on a ZFS filesystem.
 2023/01/14 04:00:43   ...done in 3h30m20.279s.
 2023/01/14 04:00:43 Creating constraints (if needed), please be patient, this may take a long time...
 2023/01/14 04:00:43   Starting block_txs block_id foreign key...
-2023/01/14 04:08:47   ...done in 8m3.746s. Starting block_txs tx_id foreign key...
-2023/01/14 04:46:29   ...done in 37m42.35s. Starting txins tx_id foreign key...
-2023/01/14 06:52:36   ...done in 2h6m7.446s. Starting txouts tx_id foreign key...
-2023/01/14 08:15:03   ...done in 1h22m27.124s.
-2023/01/14 08:15:03 Creating txins triggers.
-2023/01/14 08:15:05 Dropping _prevout_miss table.
-2023/01/14 08:15:05 Marking orphan blocks (whole chain)...
-2023/01/14 08:15:50 Done marking orphan blocks in 44.698s.
-2023/01/14 08:15:50 Reset table storage parameters: autovacuum_enabled.
-2023/01/14 08:15:50 Indexes and constraints created.
-2023/01/14 08:15:50 All done in 38h11m46.231s.
+2023/01/14 04:00:43   ...done in 547ms. Starting block_txs tx_id foreign key...
+2023/01/14 04:00:43   ...done in 52ms. Starting txins tx_id foreign key...
+2023/01/14 04:00:43   ...done in 9ms. Starting txouts tx_id foreign key...
+2023/01/14 04:00:43   ...done in 10ms.
+2023/01/14 04:00:43 Creating txins triggers.
+2023/01/14 04:00:44 Dropping _prevout_miss table.
+2023/01/14 04:00:44 Marking orphan blocks (whole chain)...
+2023/01/14 04:01:28 Done marking orphan blocks in 44.698s.
+2023/01/14 04:01:28 Reset table storage parameters: autovacuum_enabled.
+2023/01/14 04:01:28 Indexes and constraints created.
+2023/01/14 04:01:28 All done in 36h49m19.231s.
 ```
 
 There are two phases to this process, the first is just streaming the
