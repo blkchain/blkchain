@@ -319,7 +319,10 @@ func processBlocks(writer *db.PGWriter, bhs blkchain.BlockHeaderIndex, sync bool
 			Height: int(bhs.CurrentHeight()),
 		}
 
-		writer.WriteBlock(br, sync)
+		if err := writer.WriteBlock(br, sync); err != nil {
+			log.Printf("processBlocks: %v", err)
+			return err
+		}
 
 		if len(interrupt) > 0 {
 			break

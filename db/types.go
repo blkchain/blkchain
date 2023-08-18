@@ -16,6 +16,8 @@ type BlockRec struct {
 	baseSize int
 	weight   int
 	virtSize int
+
+	sync chan bool
 }
 
 type txRec struct {
@@ -30,8 +32,9 @@ type txRec struct {
 	weight   int
 	virtSize int
 
-	sync chan bool
 	dupe bool // already seen
+
+	sync chan bool
 }
 
 type txInRec struct {
@@ -39,7 +42,8 @@ type txInRec struct {
 	n       int
 	txIn    *blkchain.TxIn
 	idCache *txIdCache
-	sync    chan bool
+
+	sync chan bool
 }
 
 type txOutRec struct {
@@ -47,11 +51,6 @@ type txOutRec struct {
 	n     int
 	txOut *blkchain.TxOut
 	hash  blkchain.Uint256
-	sync  chan bool
-}
 
-// type BlockInfo struct {
-// 	*blkchain.Block
-// 	Height int
-// 	Sync   chan bool // `json:"-"` // ZZZ
-// }
+	sync chan bool
+}

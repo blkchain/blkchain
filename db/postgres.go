@@ -20,15 +20,13 @@ import (
 // become -1 in Postgres, which is fine as long as we know all the
 // bits are correct.
 
-var writerWg sync.WaitGroup
-
-type blockRecSync struct {
-	*BlockRec
-	sync chan bool
-}
+var (
+	writerWg sync.WaitGroup
+	errors   bool
+)
 
 type PGWriter struct {
-	blockCh    chan *blockRecSync
+	blockCh    chan *BlockRec
 	wg         *sync.WaitGroup
 	db         *sql.DB
 	start      time.Time
@@ -89,7 +87,7 @@ func NewPGWriter(connstr string, cacheSize int, utxo isUTXOer, zfsDataset string
 		}
 	}
 
-	bch := make(chan *blockRecSync, 2)
+	bch := make(chan *BlockRec, 2)
 	wg.Add(1)
 
 	w := &PGWriter{
@@ -116,13 +114,12 @@ func (p *PGWriter) Uptime() time.Duration {
 }
 
 func (p *PGWriter) WriteBlock(b *BlockRec, sync bool) error {
-	bs := &blockRecSync{BlockRec: b}
 	if sync {
-		bs.sync = make(chan bool)
+		b.sync = make(chan bool)
 	}
-	p.blockCh <- bs
+	p.blockCh <- b
 	if sync {
-		if ok := <-bs.sync; !ok {
+		if ok := <-b.sync; !ok {
 			log.Printf("Error writing block: %v", b.Block.Hash())
 			return fmt.Errorf("Error writing block: %v", b.Block.Hash())
 		}
@@ -134,7 +131,7 @@ func (w *PGWriter) HeightAndHashes(back int) (map[int][]blkchain.Uint256, error)
 	return getHeightAndHashes(w.db, back)
 }
 
-func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, firstImport bool, cacheSize int, utxo isUTXOer) {
+func (w *PGWriter) pgBlockWorker(ch <-chan *BlockRec, wg *sync.WaitGroup, firstImport bool, cacheSize int, utxo isUTXOer) {
 	defer wg.Done()
 
 	bid, err := getLastBlockId(w.db)
@@ -148,17 +145,24 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 		return
 	}
 
-	blockCh := make(chan *blockRecSync, 2)
-	go pgBlockWriter(blockCh, w.db)
+	errCh := make(chan error, 1)
+	go func() {
+		err := <-errCh
+		log.Printf("ERROR (all commits disabled now): %v", err)
+		errors = true
+	}()
+
+	blockCh := make(chan *BlockRec, 2)
+	go pgBlockWriter(blockCh, errCh, w.db)
 
 	txCh := make(chan *txRec, 64)
-	go pgTxWriter(txCh, w.db)
+	go pgTxWriter(txCh, errCh, w.db)
 
 	txInCh := make(chan *txInRec, 64)
-	go pgTxInWriter(txInCh, w.db, firstImport)
+	go pgTxInWriter(txInCh, errCh, w.db, firstImport)
 
 	txOutCh := make(chan *txOutRec, 64)
-	go pgTxOutWriter(txOutCh, w.db, utxo)
+	go pgTxOutWriter(txOutCh, errCh, w.db, utxo)
 
 	writerWg.Add(4)
 
@@ -291,11 +295,22 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 					hash:  hash,
 				}
 			}
+			if errors {
+				log.Printf("Errors detected, aborting.")
+				break
+			}
+		}
+
+		if errors {
+			if br.sync != nil {
+				br.sync <- false
+			}
+			break
 		}
 
 		if !firstImport {
 			// commit after every block
-			blockCh <- &blockRecSync{
+			blockCh <- &BlockRec{
 				sync: syncCh,
 			}
 			if syncCh != nil {
@@ -371,7 +386,7 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 
 	idCache.reportStats(true) // Final stats ane last time
 
-	if w.db == nil {
+	if errors || w.db == nil {
 		return
 	}
 
@@ -460,25 +475,25 @@ func (w *PGWriter) pgBlockWorker(ch <-chan *blockRecSync, wg *sync.WaitGroup, fi
 	}
 }
 
-func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
+func pgBlockWriter(c chan *BlockRec, errCh chan<- error, db *sql.DB) {
 	defer writerWg.Done()
 
 	cols := []string{"id", "height", "hash", "version", "prevhash", "merkleroot", "time", "bits", "nonce", "orphan", "size", "base_size", "weight", "virt_size"}
 
 	txn, stmt, err := begin(db, "blocks", cols)
 	if err != nil {
-		log.Printf("ERROR (1): %v", err)
+		errCh <- fmt.Errorf("pgBlockWriter1: %v", err)
+		return
 	}
 
 	for br := range c {
-
-		if br == nil || br.BlockRec == nil { // commit signal
+		if br == nil || br.Block == nil { // commit signal
 			if err := commit(stmt, txn, nil); err != nil {
-				log.Printf("Block commit error: %v", err)
+				errCh <- fmt.Errorf("BLock commit error: %v", err)
 			}
 			txn, stmt, err = begin(db, "blocks", cols)
 			if err != nil {
-				log.Printf("ERROR (2): %v", err)
+				errCh <- fmt.Errorf("pgBlockWriter2: %v", err)
 			}
 			if br != nil && br.sync != nil {
 				br.sync <- true
@@ -504,20 +519,20 @@ func pgBlockWriter(c chan *blockRecSync, db *sql.DB) {
 				br.Weight(),
 				br.VirtualSize(),
 			); err != nil {
-				log.Printf("ERROR (3): %v", err)
-
+				errCh <- fmt.Errorf("pgBlockWriter3: %v", err)
+				return
 			}
 		}
 	}
 
 	log.Printf("Block writer channel closed, commiting transaction.")
 	if err = commit(stmt, txn, nil); err != nil {
-		log.Printf("Block commit error: %v", err)
+		errCh <- fmt.Errorf("pgBlockWriter4: %v", err)
 	}
 	log.Printf("Block writer done.")
 }
 
-func pgTxWriter(c chan *txRec, db *sql.DB) {
+func pgTxWriter(c chan *txRec, errCh chan<- error, db *sql.DB) {
 	defer writerWg.Done()
 
 	cols := []string{"id", "txid", "version", "locktime", "size", "base_size", "weight", "virt_size"}
@@ -525,12 +540,14 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 
 	txn, stmt, err := begin(db, "txs", cols)
 	if err != nil {
-		log.Printf("ERROR (3): %v", err)
+		errCh <- fmt.Errorf("pgTxWriter1: %v", err)
+		return
 	}
 
 	btxn, bstmt, err := begin(db, "block_txs", bcols)
 	if err != nil {
-		log.Printf("ERROR (4): %v", err)
+		errCh <- fmt.Errorf("pgTxWriter2: %v", err)
+		return
 	}
 
 	// It's not clear that parallelizing Txs provides any speed
@@ -558,7 +575,7 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 						t.Weight(),
 						t.VirtualSize(),
 					); err != nil {
-						log.Printf("ERROR (7): %v", err)
+						errCh <- fmt.Errorf("pgTxWriter3: %v", err)
 					}
 				}
 				// It can still be a dupe if we are catching up and the
@@ -571,7 +588,7 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 					tr.n,
 					tr.id,
 				); err != nil {
-					log.Printf("ERROR (7.5): %v", err)
+					errCh <- fmt.Errorf("pgTxWriter4: %v", err)
 				}
 			}
 
@@ -590,19 +607,19 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 			wg.Wait()
 			// commit
 			if err := commit(stmt, txn, nil); err != nil {
-				log.Printf("Tx commit error: %v", err)
+				errCh <- fmt.Errorf("pgTxWriter5: %v", err)
 			}
 			if err = commit(bstmt, btxn, nil); err != nil {
-				log.Printf("Block Txs commit error: %v", err)
+				errCh <- fmt.Errorf("pgTxWriter6: %v", err)
 			}
 			var err error
 			txn, stmt, err = begin(db, "txs", cols)
 			if err != nil {
-				log.Printf("ERROR (5): %v", err)
+				errCh <- fmt.Errorf("pgTxWriter7: %v", err)
 			}
 			btxn, bstmt, err = begin(db, "block_txs", bcols)
 			if err != nil {
-				log.Printf("ERROR (6): %v", err)
+				errCh <- fmt.Errorf("pgTxWriter8: %v", err)
 			}
 			if tr != nil && tr.sync != nil {
 				tr.sync <- true
@@ -622,23 +639,24 @@ func pgTxWriter(c chan *txRec, db *sql.DB) {
 	log.Printf("Tx writer channel closed, committing transaction.")
 
 	if err := commit(stmt, txn, nil); err != nil {
-		log.Printf("Tx commit error: %v", err)
+		errCh <- fmt.Errorf("pgTxWriter9: %v", err)
 	}
 	if err := commit(bstmt, btxn, nil); err != nil {
-		log.Printf("Block Txs commit error: %v", err)
+		errCh <- fmt.Errorf("pgTxWriter10: %v", err)
 	}
 
 	log.Printf("Tx writer done.")
 }
 
-func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
+func pgTxInWriter(c chan *txInRec, errCh chan<- error, db *sql.DB, firstImport bool) {
 	defer writerWg.Done()
 
 	cols := []string{"tx_id", "n", "prevout_tx_id", "prevout_n", "scriptsig", "sequence", "witness"}
 
 	txn, stmt, err := begin(db, "txins", cols)
 	if err != nil {
-		log.Printf("ERROR (9): %v", err)
+		errCh <- fmt.Errorf("pgTxInWriter1: %v", err)
+		return
 	}
 
 	misses := make([]*prevoutMiss, 0, 2000)
@@ -663,7 +681,7 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 			// write it to the DB directly
 			if stmt != nil {
 				if err := recordPrevoutMiss(db, miss.txId, miss.n, miss.prevOutHash); err != nil {
-					log.Printf("ERROR (10.7): %v", err)
+					errCh <- fmt.Errorf("pgTxInWriter2: %v", err)
 				}
 			}
 		}
@@ -706,7 +724,7 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 					int32(t.Sequence),
 					wb,
 				); err != nil {
-					log.Printf("ERROR (11): %v", err)
+					errCh <- fmt.Errorf("pgTxInWriter3: %v", err)
 				}
 			}
 		}
@@ -727,13 +745,13 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 			mg.Wait()
 			// commit
 			if err := commit(stmt, txn, misses); err != nil {
-				log.Printf("Txin commit error: %v", err)
+				errCh <- fmt.Errorf("pgTxInWriter4: %v", err)
 			}
 			misses = misses[:0]
 			var err error
 			txn, stmt, err = begin(db, "txins", cols)
 			if err != nil {
-				log.Printf("ERROR (10): %v", err)
+				errCh <- fmt.Errorf("pgTxInWriter5: %v", err)
 			}
 			if tr != nil && tr.sync != nil {
 				tr.sync <- true
@@ -756,19 +774,20 @@ func pgTxInWriter(c chan *txInRec, db *sql.DB, firstImport bool) {
 
 	log.Printf("TxIn writer channel closed, committing transaction.")
 	if err := commit(stmt, txn, misses); err != nil {
-		log.Printf("TxIn commit error: %v", err)
+		errCh <- fmt.Errorf("pgTxInWriter6: %v", err)
 	}
 	log.Printf("TxIn writer done.")
 }
 
-func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
+func pgTxOutWriter(c chan *txOutRec, errCh chan<- error, db *sql.DB, utxo isUTXOer) {
 	defer writerWg.Done()
 
 	cols := []string{"tx_id", "n", "value", "scriptpubkey", "spent"}
 
 	txn, stmt, err := begin(db, "txouts", cols)
 	if err != nil {
-		log.Printf("ERROR (12): %v", err)
+		errCh <- fmt.Errorf("pgTxOutWriter1: %v", err)
+		return
 	}
 
 	// The call to IsUTXO() is very time consuming because it involves
@@ -787,7 +806,7 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 				// flag could also be interpeted as unspendable.
 				isUTXO, err := utxo.IsUTXO(tr.hash, uint32(tr.n))
 				if err != nil {
-					log.Printf("ERROR (13.5): %v", err)
+					errCh <- fmt.Errorf("pgTxOutWriter2: %v", err)
 				}
 				spent = !isUTXO
 			}
@@ -800,7 +819,7 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 					t.ScriptPubKey,
 					spent,
 				); err != nil {
-					log.Printf("ERROR (13.6): %v\n", err)
+					errCh <- fmt.Errorf("pgTxOutWriter3: %v", err)
 				}
 			}
 		}
@@ -818,12 +837,12 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 			wg.Wait()
 			// commit
 			if err := commit(stmt, txn, nil); err != nil {
-				log.Printf("TxOut commit error: %v", err)
+				errCh <- fmt.Errorf("pgTxOutWriter4: %v", err)
 			}
 			var err error
 			txn, stmt, err = begin(db, "txouts", cols)
 			if err != nil {
-				log.Printf("ERROR (13): %v", err)
+				errCh <- fmt.Errorf("pgTxOutWriter5: %v", err)
 			}
 			if tr != nil && tr.sync != nil {
 				tr.sync <- true
@@ -842,7 +861,7 @@ func pgTxOutWriter(c chan *txOutRec, db *sql.DB, utxo isUTXOer) {
 
 	log.Printf("TxOut writer channel closed, committing transaction.")
 	if err := commit(stmt, txn, nil); err != nil {
-		log.Printf("TxOut commit error: %v", err)
+		errCh <- fmt.Errorf("pgTxOutWriter6: %v", err)
 	}
 	log.Printf("TxOut writer done.")
 }
@@ -888,6 +907,10 @@ func commit(stmt *sql.Stmt, txn *sql.Tx, misses []*prevoutMiss) (err error) {
 		if err = fixPrevoutTxId(txn, 4, false); err != nil { // also truncates _prevout_miss
 			return err
 		}
+	}
+	if errors {
+		log.Printf("Not committing transaction because of prior errors.")
+		return fmt.Errorf("Not committing transaction because of prior errors.")
 	}
 	err = txn.Commit()
 	if err != nil {
